@@ -16,8 +16,8 @@ NTUST 114-2 資訊安全期末專題。手刻 Federated Learning + DLG 攻擊 + 
 ```
 src/           # all source modules
 experiments/   # runnable experiment scripts
-results/       # generated figures + metrics (gitignored contents)
-data/          # datasets (gitignored)
+results/       # generated figures + metrics + model checkpoints (committed, shared with the team)
+data/          # datasets (gitignored; auto-downloaded at runtime)
 ```
 
 ## Conventions
