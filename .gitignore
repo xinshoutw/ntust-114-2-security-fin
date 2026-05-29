@@ -1,0 +1,26 @@
+# Datasets (downloaded at runtime)
+/data/orl_faces/
+/data/**/*.png
+/data/**/*.pgm
+/data/**/*.mat
+/data/**/*.tar.gz
+/data/**/*.zip
+
+# Generated experiment artifacts
+/results/figures/*
+/results/metrics/*
+/results/*.pt
+!/results/figures/.gitkeep
+!/results/metrics/.gitkeep
+
+# Python / uv
+__pycache__/
+*.py[cod]
+.venv/
+.uv/
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
