@@ -90,12 +90,21 @@ def ensure_orl_dataset(data_dir: str | Path = "data") -> Path:
     return root
 
 
-def load_orl_dataset(data_dir: str | Path = "data", img_size: int = 32) -> TensorDataset:
-    """Load every ORL image as a normalised grayscale tensor.
+def load_orl_dataset(
+    data_dir: str | Path = "data", img_size: int = 32, normalize: bool = True
+) -> TensorDataset:
+    """Load every ORL image as a grayscale tensor.
 
-    Returns a :class:`TensorDataset` whose ``.tensors`` are
-    ``(images, labels)`` with shapes ``(N, 1, img_size, img_size)`` (float32 in
-    ``[0, 1]``) and ``(N,)`` (int64 labels in ``0..39``).
+    Returns a :class:`TensorDataset` whose ``.tensors`` are ``(images, labels)``
+    with shapes ``(N, 1, img_size, img_size)`` (float32) and ``(N,)`` (int64
+    labels in ``0..39``).
+
+    When ``normalize`` is True (default) the pixels are z-scored to zero mean and
+    unit variance. This matters a lot here: the network uses Sigmoid activations,
+    and feeding raw ``[0, 1]`` pixels (mean ~0.6) saturates them onto a flat loss
+    plateau that training never escapes. The mean/std used are attached to the
+    returned dataset as ``.mean`` / ``.std`` so the DLG attack can map a
+    reconstruction back to ``[0, 1]`` for display (see :func:`denormalize`).
     """
     root = ensure_orl_dataset(data_dir)
     images: list[np.ndarray] = []
@@ -106,9 +115,22 @@ def load_orl_dataset(data_dir: str | Path = "data", img_size: int = 32) -> Tenso
             img = Image.open(photo_path).convert("L").resize((img_size, img_size), Image.BILINEAR)
             images.append(np.asarray(img, dtype=np.float32) / 255.0)
             labels.append(subject - 1)  # 0-indexed labels
-    images_tensor = torch.from_numpy(np.stack(images)).unsqueeze(1)  # (N, 1, H, W)
+    images_tensor = torch.from_numpy(np.stack(images)).unsqueeze(1)  # (N, 1, H, W), in [0, 1]
+
+    mean, std = 0.0, 1.0
+    if normalize:
+        mean, std = float(images_tensor.mean()), float(images_tensor.std())
+        images_tensor = (images_tensor - mean) / std
+
     labels_tensor = torch.tensor(labels, dtype=torch.long)
-    return TensorDataset(images_tensor, labels_tensor)
+    dataset = TensorDataset(images_tensor, labels_tensor)
+    dataset.mean, dataset.std = mean, std  # type: ignore[attr-defined]
+    return dataset
+
+
+def denormalize(images: torch.Tensor, mean: float, std: float) -> torch.Tensor:
+    """Invert the z-score normalisation back to the ``[0, 1]`` pixel range."""
+    return (images * std + mean).clamp(0.0, 1.0)
 
 
 def train_test_split(

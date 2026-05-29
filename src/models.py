@@ -22,7 +22,7 @@ from torch import nn
 class LeNet(nn.Module):
     """3-conv LeNet (~40K params) matching the DLG paper, emitting raw logits."""
 
-    def __init__(self, num_classes: int = 40, in_channels: int = 1) -> None:
+    def __init__(self, num_classes: int = 40, in_channels: int = 1, dlg_init: bool = True) -> None:
         super().__init__()
         act = nn.Sigmoid
         self.body = nn.Sequential(
@@ -34,6 +34,12 @@ class LeNet(nn.Module):
             act(),
         )
         self.fc = nn.Linear(12 * 8 * 8, num_classes)
+        # The DLG uniform init is not just for the attack demo: with the deep
+        # Sigmoid stack, the default/Xavier inits sit on a flat plateau that SGD
+        # never escapes, whereas uniform(-0.5, 0.5) breaks symmetry and lets the
+        # network actually train. So we apply it by default.
+        if dlg_init:
+            self.apply(dlg_weights_init)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.body(x)

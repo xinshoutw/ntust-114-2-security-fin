@@ -28,6 +28,7 @@ class FLClient:
         device: torch.device | str,
         batch_size: int = 8,
         num_classes: int = 40,
+        optimizer: str = "adam",
     ) -> None:
         self.client_id = client_id
         self.dataset = dataset
@@ -35,7 +36,15 @@ class FLClient:
         self.model = model_cls(num_classes=num_classes).to(self.device)
         self.loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
         self.criterion = nn.CrossEntropyLoss()
+        self.optimizer_name = optimizer.lower()
         self._last_delta: dict[str, torch.Tensor] | None = None
+
+    def _make_optimizer(self, lr: float) -> torch.optim.Optimizer:
+        if self.optimizer_name == "adam":
+            return torch.optim.Adam(self.model.parameters(), lr=lr)
+        if self.optimizer_name == "sgd":
+            return torch.optim.SGD(self.model.parameters(), lr=lr, momentum=0.9)
+        raise ValueError(f"unknown optimizer: {self.optimizer_name}")
 
     @property
     def num_samples(self) -> int:
@@ -50,7 +59,7 @@ class FLClient:
     ) -> tuple[dict[str, torch.Tensor], int]:
         """Run local training and return ``(weight_delta, num_samples)``."""
         start_weights = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
-        optimizer = torch.optim.SGD(self.model.parameters(), lr=lr)
+        optimizer = self._make_optimizer(lr)
         self.model.train()
         for _ in range(local_epochs):
             for images, labels in self.loader:
