@@ -65,7 +65,7 @@ def dlg_attack(
     lr: float = 1.0,
     known_label: int | None = None,
     seed: int = 0,
-) -> tuple[torch.Tensor, int, list[float]]:
+) -> tuple[torch.Tensor, int | list[int], list[float]]:
     """Reconstruct an input image by matching gradients.
 
     If ``known_label`` is given (iDLG), only the image is optimised against a
@@ -114,5 +114,7 @@ def dlg_attack(
     if known_label is not None:
         recovered_label = known_label
     else:
-        recovered_label = int(torch.argmax(dummy_label, dim=-1).item())
+        pred = torch.argmax(dummy_label, dim=-1)
+        # Single-sample DLG returns a scalar label; a batch returns one per row.
+        recovered_label = int(pred.item()) if pred.numel() == 1 else pred.tolist()
     return dummy_image.detach().cpu(), recovered_label, history

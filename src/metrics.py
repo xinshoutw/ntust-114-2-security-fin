@@ -26,6 +26,10 @@ def compute_mse(original, recovered) -> float:
 
 def compute_psnr(original, recovered) -> float:
     a, b = _to_2d(original), _to_2d(recovered)
+    # An exact match has zero MSE; skimage would warn on the 1/0 and return inf.
+    # Short-circuit so a perfect reconstruction reads as a clean +inf dB.
+    if np.array_equal(a, b):
+        return float("inf")
     return float(peak_signal_noise_ratio(a, b, data_range=1.0))
 
 

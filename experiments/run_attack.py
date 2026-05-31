@@ -3,18 +3,34 @@
 Usage:
     uv run python experiments/run_attack.py
 
-Two settings:
-  * Demo   - an untrained (round-0) model, several different victim images, to
-             show how perfectly a single gradient leaks an image.
-  * Rounds - the FedAvg model at rounds 1/10/25/50 (from run_fl.py snapshots),
-             attacking one fixed image to see how reconstruction quality shifts
-             as training progresses.
+Threat-model note (important for honest reporting):
+    DLG here inverts a *single-sample loss gradient* -- the canonical Zhu et al.
+    setting. The real FedAvg client in this project uploads a multi-step *weight
+    delta* (batch_size=8, one local epoch of SGD/Adam steps), which is much
+    harder to invert. So these reconstructions show the upper bound of leakage
+    from one clean gradient, not an attack on the exact bytes FedAvg transmits.
+    The batch-size sweep below makes that gap concrete: leakage collapses as the
+    gradient aggregates more samples.
+
+Experiments:
+  * Demo        - an untrained (round-0) model, several victim images: how
+                  perfectly a single gradient leaks one image.
+  * Batch sweep - round-0 model, batch_size in {1,2,4,8}: leakage vs how many
+                  samples the gradient averages over.
+  * DLG vs iDLG - same image/model, joint-label DLG vs analytic-label iDLG:
+                  iDLG converges faster and more stably.
+  * Rounds      - the FedAvg model across many snapshot rounds, attacking one
+                  fixed image, to resolve how leakage decays as training proceeds.
 
 Outputs:
     results/figures/dlg_demo_comparison.png
+    results/figures/dlg_batchsize_sweep.png
+    results/figures/dlg_vs_idlg.png
     results/figures/dlg_rounds_comparison.png
+    results/figures/dlg_quality_vs_round.png
     results/figures/dlg_loss_curve.png
     results/metrics/dlg_attack_results.csv
+    results/metrics/dlg_batchsize.csv
 """
 
 from __future__ import annotations
@@ -41,6 +57,9 @@ NUM_CLASSES = 40
 NUM_ITERS = 300
 DEMO_INDICES = [0, 10, 50, 90, 130, 200, 310, 399]  # one image from several subjects
 ROUNDS_TARGET_INDEX = 5
+PANEL_ROUNDS = (1, 6, 12, 20, 50)  # subset of SNAPSHOT_ROUNDS shown as an image strip
+BATCH_SIZES = (1, 2, 4, 8)
+BATCH_INDICES = [0, 40, 80, 120, 160, 200, 240, 280]  # distinct subjects
 SUCCESS_PSNR = 20.0
 
 RESULTS = Path("results")
@@ -49,7 +68,7 @@ METRICS = RESULTS / "metrics"
 
 
 def attack_one(model, image, label, mean, std):
-    """Reconstruct ``image`` (normalised) and return ``(rec01, metrics, history)``."""
+    """Reconstruct ``image`` (normalised) with iDLG and return metrics + history."""
     grads = compute_real_gradients(model, image, label)
     inferred = idlg_label_inference(grads, NUM_CLASSES)
     rec, _, history = dlg_attack(
@@ -71,8 +90,7 @@ def attack_one(model, image, label, mean, std):
 def run_demo(imgs, lbls, mean, std):
     torch.manual_seed(0)
     model = LeNet(NUM_CLASSES, dlg_init=True).to(DEVICE).eval()
-    rows = []
-    panels = []
+    rows, panels = [], []
     for img_id in DEMO_INDICES:
         image, label = imgs[img_id : img_id + 1], lbls[img_id : img_id + 1]
         orig01, rec01, m, _ = attack_one(model, image, label, mean, std)
@@ -98,6 +116,102 @@ def run_demo(imgs, lbls, mean, std):
     return rows
 
 
+def run_batch_sweep(imgs, lbls, mean, std):
+    """Attack a batch gradient for several batch sizes; leakage drops with size.
+
+    The gradient is the mean over the batch, so individual images become harder
+    to disentangle. We use plain DLG (joint label optimisation) because analytic
+    label inference is single-sample. Quality is the permutation-invariant
+    best-match PSNR: each original scored against its closest reconstruction.
+    """
+    torch.manual_seed(0)
+    model = LeNet(NUM_CLASSES, dlg_init=True).to(DEVICE).eval()
+    rows, panels = [], []
+    for bs in BATCH_SIZES:
+        ids = BATCH_INDICES[:bs]
+        images = imgs[ids]
+        labels = lbls[ids]
+        grads = compute_real_gradients(model, images, labels)
+        rec, _, _ = dlg_attack(
+            model, grads, tuple(images.shape), (bs, NUM_CLASSES),
+            num_iterations=NUM_ITERS, device=DEVICE, known_label=None,
+        )
+        orig01 = denormalize(images, mean, std)
+        rec01 = denormalize(rec, mean, std)
+        # Best-match PSNR per original (reconstruction order is not guaranteed).
+        best = []
+        for i in range(bs):
+            best.append(max(compute_psnr(orig01[i], rec01[j]) for j in range(bs)))
+        mean_psnr = sum(best) / bs
+        rows.append({"batch_size": bs, "mean_best_psnr": mean_psnr})
+        panels.append((bs, orig01, rec01))
+        print(f"[attack] batch size {bs}: mean best-match psnr={mean_psnr:5.1f}dB")
+
+    plt.figure(figsize=(6, 4.2))
+    plt.plot([r["batch_size"] for r in rows], [r["mean_best_psnr"] for r in rows], "-o")
+    plt.axhline(SUCCESS_PSNR, ls="--", color="gray", label=f"success threshold {SUCCESS_PSNR:.0f} dB")
+    plt.xscale("log", base=2)
+    plt.xticks(BATCH_SIZES, [str(b) for b in BATCH_SIZES])
+    plt.xlabel("Batch size (samples averaged into one gradient)")
+    plt.ylabel("Mean best-match PSNR (dB)")
+    plt.title("DLG leakage collapses as the gradient averages more samples")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(FIGURES / "dlg_batchsize_sweep.png", dpi=150)
+    plt.close()
+
+    # Visual strip: originals vs best-effort reconstructions for the largest batch.
+    bs, orig01, rec01 = panels[-1]
+    fig, axes = plt.subplots(2, bs, figsize=(1.5 * bs, 3.4))
+    for i in range(bs):
+        axes[0, i].imshow(orig01[i].squeeze(), cmap="gray", vmin=0, vmax=1)
+        axes[1, i].imshow(rec01[i].squeeze(), cmap="gray", vmin=0, vmax=1)
+        for r in (0, 1):
+            axes[r, i].set_xticks([]); axes[r, i].set_yticks([])
+    axes[0, 0].set_ylabel("original", fontsize=10)
+    axes[1, 0].set_ylabel("recovered", fontsize=10)
+    fig.suptitle(f"DLG on a batch of {bs}: individual faces no longer separable", fontsize=12)
+    fig.tight_layout()
+    fig.savefig(FIGURES / "dlg_batchsize_demo.png", dpi=150)
+    plt.close(fig)
+
+    pd.DataFrame(rows).to_csv(METRICS / "dlg_batchsize.csv", index=False)
+    return rows
+
+
+def run_dlg_vs_idlg(imgs, lbls, mean, std):
+    """Compare joint-label DLG against analytic-label iDLG on the same target."""
+    torch.manual_seed(0)
+    model = LeNet(NUM_CLASSES, dlg_init=True).to(DEVICE).eval()
+    image, label = imgs[0:1], lbls[0:1]
+    orig01 = denormalize(image, mean, std)
+    grads = compute_real_gradients(model, image, label)
+    inferred = idlg_label_inference(grads, NUM_CLASSES)
+
+    results = {}
+    for name, known in (("DLG (joint label)", None), ("iDLG (analytic label)", inferred)):
+        rec, _, history = dlg_attack(
+            model, grads, tuple(image.shape), (1, NUM_CLASSES),
+            num_iterations=NUM_ITERS, device=DEVICE, known_label=known,
+        )
+        psnr = compute_psnr(orig01, denormalize(rec, mean, std))
+        results[name] = (history, psnr)
+        print(f"[attack] {name:24s}: final psnr={psnr:5.1f}dB")
+
+    plt.figure(figsize=(7, 4.5))
+    for name, (history, psnr) in results.items():
+        plt.semilogy(range(1, len(history) + 1), history, label=f"{name}  ({psnr:.0f} dB)")
+    plt.xlabel("LBFGS iteration")
+    plt.ylabel("Gradient-matching loss (log scale)")
+    plt.title("iDLG vs DLG: analytic label inference converges faster")
+    plt.grid(alpha=0.3, which="both")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(FIGURES / "dlg_vs_idlg.png", dpi=150)
+    plt.close()
+
+
 def run_rounds(imgs, lbls, mean, std):
     snapshot_path = RESULTS / "fl_snapshots.pt"
     if not snapshot_path.exists():
@@ -108,31 +222,56 @@ def run_rounds(imgs, lbls, mean, std):
     image = imgs[ROUNDS_TARGET_INDEX : ROUNDS_TARGET_INDEX + 1]
     label = lbls[ROUNDS_TARGET_INDEX : ROUNDS_TARGET_INDEX + 1]
 
-    rows, panels, histories = [], [], []
+    rows, recs, histories = [], {}, []
     for rnd in rounds:
         model = LeNet(NUM_CLASSES, dlg_init=False).to(DEVICE)
         model.load_state_dict(snapshots[rnd])
         model.eval()
         orig01, rec01, m, history = attack_one(model, image, label, mean, std)
         rows.append({"image_id": ROUNDS_TARGET_INDEX, "round": rnd, **m})
-        panels.append((rnd, rec01, m))
-        histories.append((rnd, history))
+        recs[rnd] = rec01
+        if rnd in PANEL_ROUNDS:
+            histories.append((rnd, history))
         print(f"[attack] round {rnd:2d} image {ROUNDS_TARGET_INDEX}: psnr={m['psnr']:5.1f}dB ssim={m['ssim']:.3f}")
 
     orig01 = denormalize(image, mean, std)
-    fig, axes = plt.subplots(1, len(panels) + 1, figsize=(2.0 * (len(panels) + 1), 2.6))
+
+    # (1) Curated image strip at a few representative rounds.
+    panel_rounds = [r for r in PANEL_ROUNDS if r in recs]
+    fig, axes = plt.subplots(1, len(panel_rounds) + 1, figsize=(2.0 * (len(panel_rounds) + 1), 2.6))
     axes[0].imshow(orig01.squeeze(), cmap="gray", vmin=0, vmax=1)
     axes[0].set_title("original", fontsize=10)
     axes[0].set_xticks([]); axes[0].set_yticks([])
-    for ax, (rnd, rec01, m) in zip(axes[1:], panels):
-        ax.imshow(rec01.squeeze(), cmap="gray", vmin=0, vmax=1)
-        ax.set_title(f"round {rnd}\n{m['psnr']:.0f}dB", fontsize=10)
+    for ax, rnd in zip(axes[1:], panel_rounds):
+        psnr = next(r["psnr"] for r in rows if r["round"] == rnd)
+        ax.imshow(recs[rnd].squeeze(), cmap="gray", vmin=0, vmax=1)
+        ax.set_title(f"round {rnd}\n{psnr:.0f}dB", fontsize=10)
         ax.set_xticks([]); ax.set_yticks([])
     fig.suptitle(f"DLG reconstruction of image #{ROUNDS_TARGET_INDEX} across FL rounds", fontsize=12)
     fig.tight_layout()
     fig.savefig(FIGURES / "dlg_rounds_comparison.png", dpi=150)
     plt.close(fig)
 
+    # (2) Dense quality-vs-round curve: this resolves the privacy cliff.
+    df = pd.DataFrame(rows)
+    fig, ax1 = plt.subplots(figsize=(7, 4.5))
+    ax1.plot(df["round"], df["psnr"], "-o", color="tab:blue", label="PSNR")
+    ax1.axhline(SUCCESS_PSNR, ls="--", color="gray", lw=1)
+    ax1.set_xlabel("FL communication round (model training progress)")
+    ax1.set_ylabel("PSNR (dB)", color="tab:blue")
+    ax1.tick_params(axis="y", labelcolor="tab:blue")
+    ax1.grid(alpha=0.3)
+    ax2 = ax1.twinx()
+    ax2.plot(df["round"], df["ssim"], "-s", color="tab:red", label="SSIM")
+    ax2.set_ylabel("SSIM", color="tab:red")
+    ax2.tick_params(axis="y", labelcolor="tab:red")
+    ax2.set_ylim(-0.05, 1.05)
+    fig.suptitle("DLG leakage decays as the FedAvg model trains", fontsize=12)
+    fig.tight_layout()
+    fig.savefig(FIGURES / "dlg_quality_vs_round.png", dpi=150)
+    plt.close(fig)
+
+    # (3) Optimisation convergence for the representative panel rounds.
     plt.figure(figsize=(7, 4.5))
     for rnd, history in histories:
         plt.semilogy(range(1, len(history) + 1), history, label=f"round {rnd}")
@@ -157,6 +296,10 @@ def main():
 
     print("[attack] === demo setting (untrained model) ===")
     demo_rows = run_demo(imgs, lbls, mean, std)
+    print("[attack] === batch-size sweep (untrained model) ===")
+    run_batch_sweep(imgs, lbls, mean, std)
+    print("[attack] === DLG vs iDLG (untrained model) ===")
+    run_dlg_vs_idlg(imgs, lbls, mean, std)
     print("[attack] === rounds setting (trained models) ===")
     round_rows = run_rounds(imgs, lbls, mean, std)
 

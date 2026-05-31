@@ -31,7 +31,9 @@ NUM_ROUNDS = 50
 NUM_CLIENTS = 4
 LOCAL_EPOCHS = 1
 LR = 0.01
-SNAPSHOT_ROUNDS = (1, 10, 25, 50)
+# Dense early sampling so the DLG leakage-vs-round curve resolves the "privacy
+# cliff" (gradients stop leaking once the model leaves its high-curvature init).
+SNAPSHOT_ROUNDS = (1, 2, 4, 6, 8, 10, 12, 15, 20, 25, 30, 40, 50)
 
 RESULTS = Path("results")
 FIGURES = RESULTS / "figures"
