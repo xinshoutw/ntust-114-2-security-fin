@@ -59,9 +59,11 @@ Input (1×32×32)
 - `run_federated_learning_he(...)`：HE 模式（見 Phase 3-1）。
 
 ### 1.6 `experiments/run_fl.py`
-跑 FedAvg + centralized baseline；密集 snapshot（round 1,2,4,6,8,10,12,15,20,25,30,40,50）供 Step 2 退化曲線。
-產出：`fl_accuracy_curve.png`、`fl_loss_curve.png`、`fl_training.csv`、`fl_global_model.pt`、`fl_snapshots.pt`。
-預期：FedAvg ~0.89、centralized ~0.88（相當）。
+三部分：
+- **收斂**：FedAvg(IID) vs centralized，跑 `seed ∈ {0,1,2}` 取 mean±std（單 seed 兩線會被 test 雜訊蓋過）。密集 snapshot（round 1,2,4,6,8,10,12,15,18,20,22,25,30,40,50，取 seed=0）供 Step 2 退化曲線。
+- **non-IID**：IID vs non-IID 切分在 local_epochs ∈ {1,3,5} 的最終準確率（3 seed）——本地步數越多、client drift 越大、non-IID 掉點越明顯。
+產出：`fl_accuracy_curve.png`、`fl_loss_curve.png`、`fl_noniid_comparison.png`、`fl_training.csv`、`fl_noniid.csv`、`fl_global_model.pt`、`fl_snapshots.pt`。
+預期：FedAvg 0.88±0.01、centralized 0.90±0.02（相當）；non-IID 與 IID 的差距隨 local epochs 變大（E=1 同為 0.888，E=20 時 IID 0.946 vs non-IID 0.896）。
 
 ---
 
@@ -80,7 +82,7 @@ Input (1×32×32)
 - **Progression**：擷取單張圖從隨機雜訊 → 人臉的重建過程（`dlg_progression.png`）。
 - **Batch-size sweep**：固定 round 0，batch ∈ {1,2,4,8} 跑 plain DLG，best-match PSNR 隨 batch 單調下降（80→18 dB）。
 - **DLG vs iDLG**：同圖對比收斂速度。
-- **Rounds**：對 `fl_snapshots.pt` 各 round，**每輪攻擊 8 名受害者**。主曲線畫**攻擊成功率（PSNR > 20 dB 的受害者比例）**、輔以 mean PSNR——per-victim PSNR 是雙峰（重建成功 ~50 dB 或失敗 ~5 dB，中間幾乎沒有），用平均會報出沒有任何受害者落在的數值，成功率才單調可讀。定位隱私臨界（round 1–10 維持 ~全成功，round 25 起全失敗）。
+- **Rounds**：對 `fl_snapshots.pt` 各 round，**每輪攻擊 16 名受害者**（16 distinct subjects，成功率解析度比 8 倍細、cliff 定位更準）。主曲線畫**攻擊成功率（PSNR > 20 dB 的受害者比例）**、輔以 mean PSNR——per-victim PSNR 是雙峰（重建成功 ~50 dB 或失敗 ~5 dB，中間幾乎沒有），用平均會報出沒有任何受害者落在的數值，成功率才單調可讀。定位隱私臨界（round 1–10 維持 ~全成功，round 25 起全失敗）。
 
 攻擊成功判定：PSNR > 20 dB（SSIM > 0.5）。
 產出：`dlg_demo_comparison.png`、`dlg_progression.png`、`dlg_batchsize_sweep.png`、`dlg_vs_idlg.png`、`dlg_quality_vs_round.png`、`dlg_rounds_comparison.png`、`dlg_loss_curve.png`、`dlg_attack_results.csv`、`dlg_batchsize.csv`、`dlg_quality_vs_round.csv`。
@@ -101,7 +103,7 @@ DP-FedAvg / DP-SGD 的高斯機制：
 `FLClient.train_one_round(dp_clip=C, dp_noise_multiplier=z)` 在更新離開 client 前套用；`run_federated_learning(dp_clip, dp_noise_multiplier)` 串接。
 
 ### 3.3 `experiments/run_dp.py`
-clip `C=7`（≈ 更新範數中位數），掃 noise multiplier `z ∈ {0, 0.01, …, 1.0}`，δ=1e-5、50 rounds：
+clip `C=7`（≈ 更新範數中位數），掃 noise multiplier `z ∈ {0, 0.001, 0.002, 0.003, 0.005, 0.007, 0.01, …, 1.0}`（含 z<0.01 的細粒度點以解析隱私 knee），δ=1e-5、50 rounds：
 - **效用**：FedAvg 最終準確率（3 seed mean±std）vs ε。
 - **隱私**：對單樣本梯度套同一機制後跑 DLG，PSNR/SSIM vs ε。
 產出：`dp_tradeoff.png`（x 軸標 z 與對應 ε）、`dp_leakage_demo.png`、`dp_tradeoff.csv`。
