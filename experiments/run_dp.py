@@ -19,12 +19,16 @@ the privacy axis:
                gradient is protected by the *same* mechanism (multiplier z) vs
                epsilon.
 
-Observation this surfaces: for this small but high-dimensional model the formal-DP
-regime is expensive. The noise needed to blunt gradient inversion (z >~ 0.2) has
-already collapsed accuracy to chance (which happens by z ~ 0.05); there is no z
-that both preserves accuracy and stops the attack. This is the curse of
-dimensionality in DP, and it contrasts with the HE defence (Step 3-1), which
-hides the gradient entirely at near-zero accuracy cost.
+Observation this surfaces: empirical privacy is cheap here but formal privacy is
+not. A trace of noise -- z=0.01 -- already drops DLG reconstruction from ~84 dB to
+~6 dB while accuracy is untouched (~0.89): the Gaussian noise is scaled to the
+gradient's global L2 norm yet added per coordinate, so in ~38K dimensions the
+per-coordinate signal-to-noise ratio falls below 1 even at tiny z. But that same z
+buys only epsilon ~ 3e5 -- a vacuous guarantee. Pushing epsilon into a meaningful
+range (<~10) needs z ~ O(1), which has long since collapsed accuracy to chance
+(that happens by z ~ 0.05). So on this high-dimensional model formal DP and usable
+accuracy are irreconcilable -- the curse of dimensionality -- in contrast to the HE
+defence (Step 3-1), which hides the gradient entirely at near-zero accuracy cost.
 
 Outputs:
     results/figures/dp_tradeoff.png
