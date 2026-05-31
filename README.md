@@ -1,79 +1,83 @@
-# Federated Learning: Attacks & Defenses
+# 聯邦學習：梯度洩漏攻擊與防禦
 
-NTUST 114-2 資訊安全期末專題。從頭手刻 Federated Learning，示範 Deep Leakage
-from Gradients (DLG) 梯度反演攻擊，並以 TenSEAL CKKS 同態加密做防禦。
+NTUST 114-2 資訊安全期末專題。從頭手刻 Federated Learning，示範梯度反演攻擊（DLG / iDLG），再用差分隱私與同態加密兩種防禦把攻擊擋回去。
 
-Threat model: **honest-but-curious server** — 伺服器忠實執行聚合，但會嘗試從
-client 上傳的梯度還原其私有訓練影像。
+Threat model：**honest-but-curious server**——伺服器忠實執行 FedAvg 聚合，但會試圖從 client 上傳的梯度還原其私有訓練影像。
 
-## Completed steps
+## 總覽
 
-- **Step 1 — Federated Learning**：手刻 FedAvg，4 clients、IID、ORL 人臉。
-- **Step 2 — Gradient Leakage Attack**：DLG / iDLG 從梯度還原人臉，含 batch-size
-  與訓練進度兩條退化軸。
-- **Step 3 — Differential Privacy 防禦**：client 對 update 加 Gaussian noise，
-  掃描 privacy-utility trade-off。
-- **Step 3-1 — Homomorphic Encryption 防禦（Bonus）**：TenSEAL CKKS 加密 update，
-  伺服器全程只接觸密文。
+「不上傳資料」不等於「不洩漏資料」。聯邦學習讓每個 client 只交出梯度、把原始人臉留在本地，看似就保護了隱私；但**單一梯度就足以反推出原始人臉**。本專案分四步把攻擊做出來、再擋回去：
 
-## Pipeline
+- **Step 1 — 聯邦學習**：手刻 FedAvg，4 個 client、IID 切分，在 ORL 人臉上訓練一個 LeNet（DLG 論文版：Sigmoid + strided conv，約 38K 參數），收斂到 ~0.89 測試準確率，與 centralized baseline 相當。
+- **Step 2 — 梯度反演攻擊**：以 **DLG / iDLG**（LBFGS 匹配梯度）從單一梯度還原人臉。用兩條軸觀察攻擊何時失效——**batch size**（`1 → 8`）與**訓練進度**（`round 1 → 50`）。
+- **Step 3 — 差分隱私**：client 上傳前對 weight update 加高斯噪音（**DP-FedAvg**），掃描噪音強度 `σ ∈ {0, 0.01, 0.05, 0.1, 0.25, 0.5}`，量測隱私（DLG PSNR）與效用（準確率）之間的取捨。
+- **Step 3-1 — 同態加密（Bonus）**：client 用 **TenSEAL CKKS** 加密 update，server 只在密文上做加法與 `× 1/N`，全程拿不到明文梯度，DLG 連目標函數都湊不出來。
 
-1. **Federated learning** — 4 個 client、IID 切分、FedAvg，在 ORL 人臉資料集上
-   訓練一個 ~38K 參數的 LeNet（DLG paper 版本：Sigmoid + strided conv）。
-2. **Gradient-leakage attack** — iDLG 以 LBFGS 匹配梯度，從單一梯度還原人臉。
-3. **HE defense** — client 先用 CKKS 加密 weight update 再上傳，伺服器只在密文上
-   做同態平均，全程接觸不到明文梯度。
+四組實驗共用 `seed = 0` 的 train/test 切分與 client 分割，明文、DP、HE 的結果才能彼此對照。
 
-## Setup
+---
+
+## 示例圖
+
+**Step 1 — 聯邦學習收斂**
+
+| 準確率（FedAvg vs Centralized） | 損失 |
+|:---:|:---:|
+| ![fl accuracy](results/figures/fl_accuracy_curve.png) | ![fl loss](results/figures/fl_loss_curve.png) |
+
+**Step 2 — 梯度反演攻擊**
+
+| 未訓練模型的單張還原（8 人各一張） | 還原品質隨 batch size 崩潰 |
+|:---:|:---:|
+| ![dlg demo](results/figures/dlg_demo_comparison.png) | ![dlg batch](results/figures/dlg_batchsize_sweep.png) |
+
+| 還原品質隨訓練進度衰退（PSNR / SSIM） | iDLG vs DLG 的收斂速度 |
+|:---:|:---:|
+| ![dlg rounds](results/figures/dlg_quality_vs_round.png) | ![dlg vs idlg](results/figures/dlg_vs_idlg.png) |
+
+**Step 3 — 差分隱私**
+
+| 隱私–效用權衡 | 不同 `σ` 下的還原 |
+|:---:|:---:|
+| ![dp tradeoff](results/figures/dp_tradeoff.png) | ![dp leakage](results/figures/dp_leakage_demo.png) |
+
+**Step 3-1 — 同態加密**
+
+| HE 防禦：server 只看得到密文 | 加密 vs 明文準確率 |
+|:---:|:---:|
+| ![he defense](results/figures/he_defense_demo.png) | ![he accuracy](results/figures/he_accuracy_comparison.png) |
+
+每輪 CKKS 各階段耗時（encrypt / aggregate / decrypt）：
+
+![he time](results/figures/he_time_breakdown.png)
+
+> ORL / AT&T / Olivetti 是同一份人臉資料庫（40 人 × 10 張，64×64 灰階），首次執行時自動從 GitHub PNG 鏡像下載，整理成 `data/orl_faces/s1..s40`；載入時 resize 到 32×32 並做 z-score 正規化。
+
+---
+
+## 環境與執行
 
 ```bash
-uv sync                       # Python 3.12 + torch / tenseal / scikit-image ...
+uv sync                                    # Python 3.12 + torch / tenseal / scikit-image ...
+
+uv run python experiments/run_fl.py        # Step 1：FedAvg + centralized baseline
+uv run python experiments/run_attack.py    # Step 2：DLG / iDLG 攻擊（需先跑 run_fl）
+uv run python experiments/run_dp.py        # Step 3：差分隱私防禦
+uv run python experiments/run_defense.py   # Step 3-1：CKKS 同態加密防禦
+uv run pytest                              # FedAvg / metrics / DLG / DP / HE roundtrip
 ```
 
-ORL/AT&T/Olivetti 人臉資料集會在第一次執行時自動下載（原始鏡像若失效，改從 GitHub
-PNG 鏡像取得同一份資料），整理成 `data/orl_faces/s1..s40`。
+圖表輸出於 `results/figures/`、數據於 `results/metrics/`，皆已 commit 與團隊共享；資料集會自動下載、與虛擬環境一併排除在版控外。
 
-## Run
+## 重點數據
 
-```bash
-uv run python experiments/run_fl.py        # FedAvg + centralized baseline
-uv run python experiments/run_attack.py    # DLG/iDLG leakage (needs run_fl first)
-uv run python experiments/run_dp.py        # DP defense + privacy-utility sweep
-uv run python experiments/run_defense.py    # CKKS defense + trade-off analysis
-uv run pytest                              # FedAvg / metrics / iDLG / DP / HE roundtrip
-```
-
-## Results
-
-| 階段 | 指標 | 結果 |
-|------|------|------|
-| FL 收斂 | 測試準確率 (50 rounds) | FedAvg **0.89**，centralized baseline 0.88（相當）|
-| DLG 攻擊（未訓練模型） | PSNR / 成功率 (>20 dB) | 平均 **83.8 dB**，**8/8** 張完美還原 |
-| DLG vs batch size | mean best-match PSNR | batch 1: 80 dB → batch 8: **18 dB**（梯度平均越多人越難還原）|
-| DLG vs iDLG | 收斂速度 / PSNR | iDLG **84 dB** 且收斂更快 vs DLG 80 dB |
-| DLG vs 訓練進度 | image #5 PSNR/SSIM | round 1-20: 40-60 dB → **round 25 起斷崖至 ~5 dB**（隱私臨界點）|
-| DP 防禦 | 隱私 vs 準確率 | σ 0→0.5：DLG **84→9 dB**，準確率僅 0.89→0.86（零均值噪音跨輪平均掉）|
-| HE 收斂性 | 加密 vs 明文準確率差 | 全程 ≤ **0.0125**（CKKS 精度損失可忽略）|
-| HE 防禦 | 結構性論證 | server 無 secret key → `decrypt()` 拋 `ValueError`、密文熵 **7.97/8.00** bits/byte → DLG 目標無法構造 |
-| HE 成本 | 通訊量 / 每輪耗時 | 密文 **32.7×** 明文；encrypt 0.17s / aggregate 0.03s / decrypt 0.01s |
-
-圖表輸出於 `results/figures/`，數據於 `results/metrics/`（皆已 commit，與團隊共享）。
-
-## Key implementation notes
-
-- **架構選擇**：採用 DLG paper 的 LeNet（Sigmoid、strided conv、~38K 參數）。
-  Sigmoid 的二階導數平滑，是 LBFGS 反演能成功的關鍵；ReLU 會讓重建失敗。
-- **訓練可收斂性**：純 Sigmoid 網路餵原始 `[0,1]` 像素會卡在損失平台，需把輸入
-  z-score 正規化並用 DLG uniform 初始化，才能順利訓練到 ~88%。
-- **CKKS 切片**：`poly_modulus_degree=8192` 只有 4096 slots，但 TenSEAL 會自動把
-  超長向量拆成多個密文，故每個參數直接加密成單一 `ckks_vector` 即可。
-- **威脅模型誠實度**：DLG 還原的是「單樣本 loss gradient」（canonical 設定）；真實
-  FedAvg client 上傳的是多步 weight delta（batch=8），明顯更難還原。batch-size 掃描
-  即量化了這個差距（batch 8 已掉到 18 dB）。
-- **HE 防禦是結構性的**：不是「對密文跑 DLG 失敗」，而是 server 沒有 secret key、
-  根本無法解密取得明文梯度，因此連 DLG 的目標函數都無法構造。
-- **DP 為何幾乎不傷準確率**：client 加的是零均值噪音，經 4 clients × 50 rounds 聚合
-  後平均掉，故 σ 拉到 0.5 仍維持 ~0.86，但單發 DLG 已被打到 9 dB。
-- **裝置**：FL 訓練用 MPS，DLG（LBFGS）與所有 TenSEAL 運算固定在 CPU。
-
-詳見 `PLAN.md`。
+| 階段 | 結果 |
+|------|------|
+| FL 收斂 | FedAvg 0.89、centralized 0.88（相當）|
+| DLG（未訓練模型） | 8/8 完美還原，平均 83.8 dB |
+| DLG vs batch size | batch `1 → 8`：80 → 18 dB |
+| DLG vs 訓練進度 | round 20 仍有 38 dB，round 25 起斷崖至 ~5 dB |
+| DP 防禦 | `σ 0 → 0.5`：DLG 84 → 9 dB，準確率僅 0.89 → 0.86 |
+| HE 收斂 | 加密 vs 明文準確率差 ≤ 0.0125 |
+| HE 防禦 | server 無 secret key，`decrypt()` 直接拋例外，密文熵 7.97/8 bits/byte |
+| HE 成本 | 密文 32.7× 明文；每輪 encrypt 0.17s / aggregate 0.03s / decrypt 0.01s |
