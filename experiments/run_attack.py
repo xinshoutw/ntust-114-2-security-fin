@@ -43,6 +43,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import torch
 
@@ -59,7 +60,10 @@ NUM_ITERS = 300
 DEMO_INDICES = [0, 10, 50, 90, 130, 200, 310, 399]  # one image from several subjects
 PROGRESSION_INDEX = 0
 PROGRESSION_ITERS = (0, 3, 10, 30, 100, 300)  # 0 = random init
-ROUNDS_TARGET_INDEX = 5
+# Attack several victims per round so the leakage-vs-round curve is a mean +/- std
+# band, not one image's noisy trajectory. One of these is also shown as the strip.
+ROUNDS_TARGET_INDICES = (5, 40, 90, 130, 200, 250, 310, 399)  # 8 distinct subjects
+ROUNDS_STRIP_INDEX = 5  # the victim shown in the image strip + loss curve
 PANEL_ROUNDS = (1, 6, 12, 20, 50)  # subset of SNAPSHOT_ROUNDS shown as an image strip
 BATCH_SIZES = (1, 2, 4, 8)
 BATCH_INDICES = [0, 40, 80, 120, 160, 200, 240, 280]  # distinct subjects
@@ -255,65 +259,87 @@ def run_dlg_vs_idlg(imgs, lbls, mean, std):
 
 
 def run_rounds(imgs, lbls, mean, std):
+    """Attack several victims at each FL snapshot; leakage decays as the model trains.
+
+    Attacking one image gives a noisy, non-monotone curve (the per-image PSNR
+    depends on that image's local loss landscape). Averaging over several victims
+    per round yields a clean mean +/- std band that locates the privacy cliff.
+    """
     snapshot_path = RESULTS / "fl_snapshots.pt"
     if not snapshot_path.exists():
         print(f"[attack] {snapshot_path} not found - run experiments/run_fl.py first; skipping rounds")
         return []
     snapshots = torch.load(snapshot_path, weights_only=True)
     rounds = sorted(snapshots)
-    image = imgs[ROUNDS_TARGET_INDEX : ROUNDS_TARGET_INDEX + 1]
-    label = lbls[ROUNDS_TARGET_INDEX : ROUNDS_TARGET_INDEX + 1]
 
-    rows, recs, histories = [], {}, []
+    rows, agg, strip_recs, histories = [], [], {}, []
     for rnd in rounds:
         model = LeNet(NUM_CLASSES, dlg_init=False).to(DEVICE)
         model.load_state_dict(snapshots[rnd])
         model.eval()
-        orig01, rec01, m, history = attack_one(model, image, label, mean, std)
-        rows.append({"image_id": ROUNDS_TARGET_INDEX, "round": rnd, **m})
-        recs[rnd] = rec01
-        if rnd in PANEL_ROUNDS:
-            histories.append((rnd, history))
-        print(f"[attack] round {rnd:2d} image {ROUNDS_TARGET_INDEX}: psnr={m['psnr']:5.1f}dB ssim={m['ssim']:.3f}")
+        psnrs, ssims = [], []
+        for idx in ROUNDS_TARGET_INDICES:
+            image = imgs[idx : idx + 1]
+            label = lbls[idx : idx + 1]
+            _, rec01, m, history = attack_one(model, image, label, mean, std)
+            rows.append({"image_id": idx, "round": rnd, **m})
+            psnrs.append(m["psnr"]); ssims.append(m["ssim"])
+            if idx == ROUNDS_STRIP_INDEX:
+                strip_recs[rnd] = rec01
+                if rnd in PANEL_ROUNDS:
+                    histories.append((rnd, history))
+        psnrs, ssims = np.array(psnrs), np.array(ssims)
+        agg.append({
+            "round": rnd,
+            "psnr_mean": float(psnrs.mean()), "psnr_std": float(psnrs.std()),
+            "ssim_mean": float(ssims.mean()), "ssim_std": float(ssims.std()),
+        })
+        print(f"[attack] round {rnd:2d}: psnr={psnrs.mean():5.1f}+/-{psnrs.std():4.1f}dB "
+              f"ssim={ssims.mean():.3f}  (n={len(psnrs)} victims)")
 
-    orig01 = denormalize(image, mean, std)
+    strip_img = imgs[ROUNDS_STRIP_INDEX : ROUNDS_STRIP_INDEX + 1]
+    orig01 = denormalize(strip_img, mean, std)
+    adf = pd.DataFrame(agg)
 
-    # (1) Curated image strip at a few representative rounds.
-    panel_rounds = [r for r in PANEL_ROUNDS if r in recs]
+    # (1) Curated image strip at a few representative rounds (one victim).
+    panel_rounds = [r for r in PANEL_ROUNDS if r in strip_recs]
     fig, axes = plt.subplots(1, len(panel_rounds) + 1, figsize=(2.0 * (len(panel_rounds) + 1), 2.6))
     axes[0].imshow(orig01.squeeze(), cmap="gray", vmin=0, vmax=1)
     axes[0].set_title("original", fontsize=10)
     axes[0].set_xticks([]); axes[0].set_yticks([])
     for ax, rnd in zip(axes[1:], panel_rounds):
-        psnr = next(r["psnr"] for r in rows if r["round"] == rnd)
-        ax.imshow(recs[rnd].squeeze(), cmap="gray", vmin=0, vmax=1)
+        psnr = next(r["psnr"] for r in rows if r["round"] == rnd and r["image_id"] == ROUNDS_STRIP_INDEX)
+        ax.imshow(strip_recs[rnd].squeeze(), cmap="gray", vmin=0, vmax=1)
         ax.set_title(f"round {rnd}\n{psnr:.0f}dB", fontsize=10)
         ax.set_xticks([]); ax.set_yticks([])
-    fig.suptitle(f"DLG reconstruction of image #{ROUNDS_TARGET_INDEX} across FL rounds", fontsize=12)
+    fig.suptitle(f"DLG reconstruction of image #{ROUNDS_STRIP_INDEX} across FL rounds", fontsize=12)
     fig.tight_layout()
     fig.savefig(FIGURES / "dlg_rounds_comparison.png", dpi=150)
     plt.close(fig)
 
-    # (2) Dense quality-vs-round curve: this resolves the privacy cliff.
-    df = pd.DataFrame(rows)
+    # (2) Quality-vs-round as a mean +/- std band over victims: resolves the cliff.
     fig, ax1 = plt.subplots(figsize=(7, 4.5))
-    ax1.plot(df["round"], df["psnr"], "-o", color="tab:blue", label="PSNR")
-    ax1.axhline(SUCCESS_PSNR, ls="--", color="gray", lw=1)
+    ax1.plot(adf["round"], adf["psnr_mean"], "-o", color="tab:blue", label="PSNR (mean)")
+    ax1.fill_between(adf["round"], adf["psnr_mean"] - adf["psnr_std"],
+                     adf["psnr_mean"] + adf["psnr_std"], color="tab:blue", alpha=0.2)
+    ax1.axhline(SUCCESS_PSNR, ls="--", color="gray", lw=1, label=f"success {SUCCESS_PSNR:.0f} dB")
     ax1.set_xlabel("FL communication round (model training progress)")
     ax1.set_ylabel("PSNR (dB)", color="tab:blue")
     ax1.tick_params(axis="y", labelcolor="tab:blue")
     ax1.grid(alpha=0.3)
     ax2 = ax1.twinx()
-    ax2.plot(df["round"], df["ssim"], "-s", color="tab:red", label="SSIM")
+    ax2.plot(adf["round"], adf["ssim_mean"], "-s", color="tab:red", label="SSIM (mean)")
+    ax2.fill_between(adf["round"], adf["ssim_mean"] - adf["ssim_std"],
+                     adf["ssim_mean"] + adf["ssim_std"], color="tab:red", alpha=0.15)
     ax2.set_ylabel("SSIM", color="tab:red")
     ax2.tick_params(axis="y", labelcolor="tab:red")
     ax2.set_ylim(-0.05, 1.05)
-    fig.suptitle("DLG leakage decays as the FedAvg model trains", fontsize=12)
+    fig.suptitle(f"DLG leakage decays as the FedAvg model trains (mean over {len(ROUNDS_TARGET_INDICES)} victims)", fontsize=11)
     fig.tight_layout()
     fig.savefig(FIGURES / "dlg_quality_vs_round.png", dpi=150)
     plt.close(fig)
 
-    # (3) Optimisation convergence for the representative panel rounds.
+    # (3) Optimisation convergence for the representative panel rounds (strip victim).
     plt.figure(figsize=(7, 4.5))
     for rnd, history in histories:
         plt.semilogy(range(1, len(history) + 1), history, label=f"round {rnd}")
