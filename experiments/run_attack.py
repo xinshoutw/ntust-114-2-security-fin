@@ -19,8 +19,10 @@ Experiments:
                   samples the gradient averages over.
   * DLG vs iDLG - same image/model, joint-label DLG vs analytic-label iDLG:
                   iDLG converges faster and more stably.
-  * Rounds      - the FedAvg model across many snapshot rounds, attacking one
-                  fixed image, to resolve how leakage decays as training proceeds.
+  * Rounds      - the FedAvg model across many snapshot rounds, attacking several
+                  victims per round, to resolve how leakage decays as training
+                  proceeds. Reported as the attack success rate over the victims
+                  (per-victim PSNR is bimodal, so a mean PSNR misleads).
 
 Outputs:
     results/figures/dlg_demo_comparison.png
@@ -32,6 +34,7 @@ Outputs:
     results/figures/dlg_loss_curve.png
     results/metrics/dlg_attack_results.csv
     results/metrics/dlg_batchsize.csv
+    results/metrics/dlg_quality_vs_round.csv
 """
 
 from __future__ import annotations
@@ -289,13 +292,16 @@ def run_rounds(imgs, lbls, mean, std):
                 if rnd in PANEL_ROUNDS:
                     histories.append((rnd, history))
         psnrs, ssims = np.array(psnrs), np.array(ssims)
+        success_rate = float((psnrs > SUCCESS_PSNR).mean())
         agg.append({
             "round": rnd,
+            "success_rate": success_rate,
             "psnr_mean": float(psnrs.mean()), "psnr_std": float(psnrs.std()),
             "ssim_mean": float(ssims.mean()), "ssim_std": float(ssims.std()),
         })
-        print(f"[attack] round {rnd:2d}: psnr={psnrs.mean():5.1f}+/-{psnrs.std():4.1f}dB "
-              f"ssim={ssims.mean():.3f}  (n={len(psnrs)} victims)")
+        print(f"[attack] round {rnd:2d}: success {success_rate:.0%} (PSNR>{SUCCESS_PSNR:.0f}dB) | "
+              f"psnr={psnrs.mean():5.1f}+/-{psnrs.std():4.1f}dB ssim={ssims.mean():.3f}  "
+              f"(n={len(psnrs)} victims)")
 
     strip_img = imgs[ROUNDS_STRIP_INDEX : ROUNDS_STRIP_INDEX + 1]
     orig01 = denormalize(strip_img, mean, std)
@@ -317,27 +323,33 @@ def run_rounds(imgs, lbls, mean, std):
     fig.savefig(FIGURES / "dlg_rounds_comparison.png", dpi=150)
     plt.close(fig)
 
-    # (2) Quality-vs-round as a mean +/- std band over victims: resolves the cliff.
-    fig, ax1 = plt.subplots(figsize=(7, 4.5))
-    ax1.plot(adf["round"], adf["psnr_mean"], "-o", color="tab:blue", label="PSNR (mean)")
-    ax1.fill_between(adf["round"], adf["psnr_mean"] - adf["psnr_std"],
-                     adf["psnr_mean"] + adf["psnr_std"], color="tab:blue", alpha=0.2)
-    ax1.axhline(SUCCESS_PSNR, ls="--", color="gray", lw=1, label=f"success {SUCCESS_PSNR:.0f} dB")
+    # (2) Attack success rate is the honest way to show the privacy cliff. Per
+    # victim the outcome is bimodal -- DLG either converges to the face (~50 dB) or
+    # stalls at noise (~5 dB), with almost nothing between -- so a mean PSNR reports
+    # a value no victim actually attains and its std band swamps the curve. The
+    # fraction of victims above the success threshold is monotone and pins the cliff
+    # to a round range; mean PSNR is kept as a faint secondary trace for magnitude.
+    fig, ax1 = plt.subplots(figsize=(7.4, 4.5))
+    ax1.plot(adf["round"], 100 * adf["success_rate"], "-o", color="tab:blue", lw=2.2,
+             label=f"attack success rate (PSNR > {SUCCESS_PSNR:.0f} dB)")
     ax1.set_xlabel("FL communication round (model training progress)")
-    ax1.set_ylabel("PSNR (dB)", color="tab:blue")
+    ax1.set_ylabel(f"DLG success rate over {len(ROUNDS_TARGET_INDICES)} victims (%)", color="tab:blue")
     ax1.tick_params(axis="y", labelcolor="tab:blue")
+    ax1.set_ylim(-5, 105)
     ax1.grid(alpha=0.3)
     ax2 = ax1.twinx()
-    ax2.plot(adf["round"], adf["ssim_mean"], "-s", color="tab:red", label="SSIM (mean)")
-    ax2.fill_between(adf["round"], adf["ssim_mean"] - adf["ssim_std"],
-                     adf["ssim_mean"] + adf["ssim_std"], color="tab:red", alpha=0.15)
-    ax2.set_ylabel("SSIM", color="tab:red")
+    ax2.plot(adf["round"], adf["psnr_mean"], "--s", color="tab:red", ms=4, lw=1.2, alpha=0.7,
+             label="mean PSNR of all victims (dB)")
+    ax2.axhline(SUCCESS_PSNR, ls=":", color="gray", lw=1)
+    ax2.set_ylabel("Mean PSNR (dB)", color="tab:red")
     ax2.tick_params(axis="y", labelcolor="tab:red")
-    ax2.set_ylim(-0.05, 1.05)
-    fig.suptitle(f"DLG leakage decays as the FedAvg model trains (mean over {len(ROUNDS_TARGET_INDICES)} victims)", fontsize=11)
+    lines = ax1.get_lines()[:1] + ax2.get_lines()[:1]
+    ax1.legend(lines, [ln.get_label() for ln in lines], loc="center left", fontsize=9)
+    fig.suptitle("DLG attack success collapses once the FedAvg model fits the samples", fontsize=11)
     fig.tight_layout()
     fig.savefig(FIGURES / "dlg_quality_vs_round.png", dpi=150)
     plt.close(fig)
+    adf.to_csv(METRICS / "dlg_quality_vs_round.csv", index=False)
 
     # (3) Optimisation convergence for the representative panel rounds (strip victim).
     plt.figure(figsize=(7, 4.5))
