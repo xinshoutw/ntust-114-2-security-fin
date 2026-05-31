@@ -39,13 +39,14 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src import he_utils
-from src.data_utils import denormalize, load_orl_dataset
+from src.data_utils import denormalize, load_orl_dataset, split_iid, train_test_split
 from src.dlg_attack import compute_real_gradients, dlg_attack, idlg_label_inference
 from src.federated import get_device, run_federated_learning_he
+from src.fl_client import FLClient
 from src.metrics import compute_psnr
 from src.models import LeNet
 
-HE_ROUNDS = 30
+HE_ROUNDS = 50  # match the plaintext FL run so the encrypted curve reaches the same plateau
 NUM_CLASSES = 40
 DEMO_INDEX = 5
 
@@ -84,6 +85,41 @@ def part_a_convergence(device):
     return he
 
 
+def _ckks_precision(device="cpu"):
+    """Relative L2 error of one CKKS-aggregated round vs the exact plaintext FedAvg.
+
+    Quantifies *why* HE costs ~no accuracy: the only difference from plaintext FedAvg
+    is CKKS's tiny fixed-point rounding. We train one real round per client, then
+    compare the encrypted->aggregated->decrypted weighted average against the exact
+    plaintext weighted average.
+    """
+    full = load_orl_dataset()
+    train_set, _ = train_test_split(full, seed=0)
+    shards = split_iid(train_set, num_clients=4, seed=0)
+    init = {k: v.detach().cpu().clone() for k, v in LeNet(NUM_CLASSES).state_dict().items()}
+    deltas, counts = [], []
+    for i, shard in enumerate(shards):
+        client = FLClient(i, shard, LeNet, device, num_classes=NUM_CLASSES)
+        client.update_model(init)
+        delta, n = client.train_one_round(local_epochs=1, lr=0.01)
+        deltas.append({k: v.detach().cpu() for k, v in delta.items()})
+        counts.append(n)
+    total = sum(counts)
+    weights = [n / total for n in counts]
+    plain = {k: sum(w * d[k] for w, d in zip(weights, deltas)) for k in init}
+
+    ctx = he_utils.create_he_context()
+    shapes = he_utils.get_shapes(init)
+    enc = [he_utils.encrypt_gradients(d, ctx) for d in deltas]
+    dec = he_utils.decrypt_gradients(he_utils.aggregate_encrypted(enc, weights=weights), shapes)
+
+    pf = torch.cat([plain[k].flatten() for k in init])
+    decf = torch.cat([dec[k].flatten() for k in init])
+    rel = float((decf - pf).norm() / pf.norm())
+    max_abs = float((decf - pf).abs().max())
+    return rel, max_abs
+
+
 def part_c_tradeoff(he):
     timing = pd.DataFrame(he["timing"])
     history = pd.DataFrame(he["history"])
@@ -93,15 +129,33 @@ def part_c_tradeoff(he):
 
     comm = he["comm"]
     ratio = comm["ciphertext_bytes"] / comm["plaintext_bytes"]
+    # Total CKKS wall-clock across the run (the "time consuming" axis the PDF asks for).
+    total_enc = float(timing["encrypt"].sum())
+    total_agg = float(timing["aggregate"].sum())
+    total_dec = float(timing["decrypt"].sum())
+    total_he = total_enc + total_agg + total_dec
+    rel_err, max_err = _ckks_precision()
     pd.DataFrame([{
         "plaintext_size_bytes": comm["plaintext_bytes"],
         "ciphertext_size_bytes": comm["ciphertext_bytes"],
         "ratio": ratio,
+        "total_he_seconds": total_he,
+        "total_encrypt_s": total_enc,
+        "total_aggregate_s": total_agg,
+        "total_decrypt_s": total_dec,
+        "ckks_rel_l2_error": rel_err,
+        "ckks_max_abs_error": max_err,
     }]).to_csv(METRICS / "he_communication.csv", index=False)
     print(
         f"[defense] communication per client update: plaintext={comm['plaintext_bytes']/1024:.0f} KB "
         f"ciphertext={comm['ciphertext_bytes']/1024:.0f} KB ({ratio:.1f}x)"
     )
+    print(
+        f"[defense] total CKKS wall-clock over {len(timing)} rounds: {total_he:.1f}s "
+        f"(encrypt {total_enc:.1f}s + aggregate {total_agg:.1f}s + decrypt {total_dec:.1f}s)"
+    )
+    print(f"[defense] CKKS aggregation precision: rel L2 error={rel_err:.2e}, max abs error={max_err:.2e} "
+          f"(why HE costs ~no accuracy)")
 
     plt.figure(figsize=(8, 4.5))
     rounds = timing["round"]

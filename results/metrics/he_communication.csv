@@ -1,2 +1,2 @@
-plaintext_size_bytes,ciphertext_size_bytes,ratio
-153184,5014348,32.73414978065594
+plaintext_size_bytes,ciphertext_size_bytes,ratio,total_he_seconds,total_encrypt_s,total_aggregate_s,total_decrypt_s,ckks_rel_l2_error,ckks_max_abs_error
+153184,5014552,32.735481512429494,11.647544834762812,8.781075545120984,2.335815917234868,0.5306533724069595,1.6127597746162792e-07,2.2351741790771484e-08
