@@ -6,9 +6,12 @@ Usage:
 Three parts:
   A. Convergence - encrypted FedAvg vs the identical plaintext trajectory, to
      show CKKS does not hurt accuracy.
-  B. Defence     - the server holds only ciphertext, so DLG has no plaintext
-     gradient to invert; feeding the raw ciphertext bytes to the attack yields
-     pure noise, next to the successful plaintext-gradient reconstruction.
+  B. Defence     - the *structural* argument: the server holds only ciphertext
+     under a public (secret-key-free) context, so it cannot decrypt the gradient
+     and therefore cannot even form the DLG gradient-matching objective. We show
+     the successful plaintext-gradient reconstruction beside what the server
+     actually holds under HE (a high-entropy ciphertext blob) and confirm its
+     decrypt() raises.
   C. Trade-off   - per-round encrypt/aggregate/decrypt timing and the
      plaintext-vs-ciphertext communication blow-up.
 
@@ -22,7 +25,6 @@ Outputs:
 
 from __future__ import annotations
 
-import math
 import sys
 from pathlib import Path
 
@@ -40,7 +42,7 @@ from src import he_utils
 from src.data_utils import denormalize, load_orl_dataset
 from src.dlg_attack import compute_real_gradients, dlg_attack, idlg_label_inference
 from src.federated import get_device, run_federated_learning_he
-from src.metrics import compute_psnr, compute_ssim
+from src.metrics import compute_psnr
 from src.models import LeNet
 
 HE_ROUNDS = 30
@@ -121,25 +123,39 @@ def part_c_tradeoff(he):
     )
 
 
-def _ciphertext_surrogate(serialized, shapes):
-    """Turn a parameter's raw ciphertext bytes into a same-shaped float tensor.
+def _ciphertext_preview(serialized: dict[str, bytes], side: int = 32) -> np.ndarray:
+    """Render the server's actual HE view -- raw ciphertext bytes -- as an image.
 
-    This is the best an attacker can do with only ciphertext (no secret key):
-    treat the encrypted payload as if it were the gradient. It is statistical
-    noise, so DLG cannot reconstruct anything.
+    This is *all* an honest-but-curious server holds: a high-entropy byte blob.
+    It is shown only to make "the server sees ciphertext, not a gradient"
+    concrete; it is NOT fed to DLG (the server cannot decrypt it, so there is no
+    gradient for DLG to invert in the first place).
     """
-    surrogate = []
-    for name, shape in shapes.items():
-        need = int(np.prod(shape))
-        raw = np.frombuffer(serialized[name], dtype=np.uint8).astype(np.float32)
-        reps = math.ceil(need / len(raw))
-        arr = np.tile(raw, reps)[:need]
-        arr = (arr - arr.mean()) / (arr.std() + 1e-8)  # gradient-like scale
-        surrogate.append(torch.tensor(arr, dtype=torch.float32).reshape(shape))
-    return surrogate
+    blob = b"".join(serialized.values())
+    arr = np.frombuffer(blob[: side * side], dtype=np.uint8).astype(np.float32) / 255.0
+    return arr.reshape(side, side)
+
+
+def _byte_entropy(serialized: dict[str, bytes]) -> float:
+    """Shannon entropy of the ciphertext in bits/byte (8.0 = perfectly uniform)."""
+    blob = np.frombuffer(b"".join(serialized.values()), dtype=np.uint8)
+    counts = np.bincount(blob, minlength=256).astype(np.float64)
+    p = counts[counts > 0] / counts.sum()
+    return float(-(p * np.log2(p)).sum())
 
 
 def part_b_defense_demo():
+    """Show the HE defence as it actually works: the server never gets the gradient.
+
+    No defence  -> the server holds the plaintext gradient and DLG reconstructs
+                   the victim's face.
+    HE defence  -> the client encrypts the gradient; the server's public context
+                   has no secret key, so decrypt() raises and the server only
+                   ever holds a high-entropy ciphertext blob. With no plaintext
+                   gradient, the DLG objective grad_diff = ||g_dummy - g_real||^2
+                   cannot even be formed. The defence is structural, not "DLG ran
+                   on ciphertext and happened to fail".
+    """
     torch.manual_seed(0)
     full = load_orl_dataset()
     imgs, lbls = full.tensors
@@ -150,7 +166,7 @@ def part_b_defense_demo():
     label = lbls[DEMO_INDEX : DEMO_INDEX + 1]
     orig01 = denormalize(image, mean, std)
 
-    # Unprotected: the server has the plaintext gradient -> DLG succeeds.
+    # --- No defence: the server has the plaintext gradient -> DLG succeeds. ---
     real_grads = compute_real_gradients(model, image, label)
     inferred = idlg_label_inference(real_grads, NUM_CLASSES)
     rec_plain, _, _ = dlg_attack(
@@ -159,30 +175,53 @@ def part_b_defense_demo():
     )
     psnr_plain = compute_psnr(orig01, denormalize(rec_plain, mean, std))
 
-    # Protected: encrypt the gradient; the server only sees ciphertext bytes.
+    # --- HE defence: client encrypts; server gets a public (no-secret-key) ctx. ---
     state = model.state_dict()
     grad_dict = {name: g for name, g in zip(state.keys(), real_grads)}
-    ctx = he_utils.create_he_context()
-    serialized = he_utils.serialize_encrypted(he_utils.encrypt_gradients(grad_dict, ctx))
-    surrogate = _ciphertext_surrogate(serialized, he_utils.get_shapes(state))
-    rec_he, _, _ = dlg_attack(
-        model, surrogate, tuple(image.shape), (1, NUM_CLASSES),
-        num_iterations=300, device="cpu", known_label=inferred,
-    )
-    psnr_he = compute_psnr(orig01, denormalize(rec_he, mean, std))
-    print(f"[defense] DLG PSNR: plaintext-gradient={psnr_plain:.1f}dB  on-ciphertext={psnr_he:.1f}dB")
+    full_ctx = he_utils.create_he_context()
+    public_ctx = he_utils.create_public_context(full_ctx)
+    serialized = he_utils.serialize_encrypted(he_utils.encrypt_gradients(grad_dict, full_ctx))
 
-    fig, axes = plt.subplots(1, 3, figsize=(7.5, 2.9))
-    for ax, img, title in zip(
-        axes,
-        [orig01, denormalize(rec_plain, mean, std), denormalize(rec_he, mean, std)],
-        ["original", f"no defence\nDLG on gradient\n{psnr_plain:.0f} dB",
-         f"HE defence\nDLG on ciphertext\n{psnr_he:.0f} dB"],
-    ):
-        ax.imshow(img.squeeze(), cmap="gray", vmin=0, vmax=1)
-        ax.set_title(title, fontsize=10)
+    # The server links the ciphertext to its public context and tries to read it.
+    on_server = he_utils.deserialize_encrypted(serialized, public_ctx)
+    try:
+        on_server[next(iter(on_server))].decrypt()
+        server_can_decrypt, decrypt_error = True, "none"
+    except Exception as exc:  # noqa: BLE001 - exact type is TenSEAL-internal
+        server_can_decrypt, decrypt_error = False, type(exc).__name__
+
+    entropy = _byte_entropy(serialized)
+    print(
+        f"[defense] no-defence DLG PSNR={psnr_plain:.1f}dB | "
+        f"server can decrypt under HE? {server_can_decrypt} ({decrypt_error}) | "
+        f"ciphertext entropy={entropy:.2f}/8.00 bits/byte"
+    )
+    print(
+        "[defense] => structural defence: no secret key -> no plaintext gradient "
+        "-> the DLG gradient-matching objective cannot be formed."
+    )
+
+    preview = _ciphertext_preview(serialized)
+    fig, axes = plt.subplots(1, 3, figsize=(8.0, 3.1))
+    panels = [
+        (orig01.squeeze(), "original\n(victim image)"),
+        (
+            denormalize(rec_plain, mean, std).squeeze(),
+            f"NO defence\nserver holds plaintext grad\nDLG succeeds: {psnr_plain:.0f} dB",
+        ),
+        (
+            preview,
+            "HE defence\nserver's entire view = ciphertext\n"
+            f"decrypt() raises ({decrypt_error})\nentropy {entropy:.1f}/8 bits",
+        ),
+    ]
+    for ax, (img, title) in zip(axes, panels):
+        ax.imshow(img, cmap="gray", vmin=0, vmax=1)
+        ax.set_title(title, fontsize=9)
         ax.set_xticks([]); ax.set_yticks([])
-    fig.suptitle("Homomorphic encryption defeats gradient leakage", fontsize=12)
+    fig.suptitle(
+        "HE defeats gradient leakage by withholding the plaintext gradient", fontsize=11
+    )
     fig.tight_layout()
     fig.savefig(FIGURES / "he_defense_demo.png", dpi=150)
     plt.close(fig)
