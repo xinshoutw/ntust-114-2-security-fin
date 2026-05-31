@@ -4,9 +4,11 @@ Usage:
     uv run python experiments/run_fl.py
 
 Three things are produced:
-  * Convergence  - FedAvg (IID) vs centralized, averaged over several seeds so the
-    curves carry a mean +/- std band (a single seed makes the two indistinguishable
-    and can even put FedAvg above centralized by test-set noise).
+  * Convergence  - centralized vs FedAvg (IID) vs local-only, averaged over several
+    seeds so the curves carry a mean +/- std band. The three bracket the value of
+    federation: centralized (data pooled, upper bound) >= FedAvg (data local,
+    updates averaged) >> local-only (data local AND never aggregated, lower bound).
+    The FedAvg-vs-local-only gap is what aggregation actually buys.
   * Non-IID      - FedAvg under an IID split vs a pathological label-partition split
     (each client owns a disjoint block of subjects), swept over the number of local
     epochs. This surfaces client drift: at one local epoch the two splits are
@@ -42,7 +44,12 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.federated import get_device, run_federated_learning, train_centralized
+from src.federated import (
+    get_device,
+    run_federated_learning,
+    train_centralized,
+    train_local_only,
+)
 
 NUM_ROUNDS = 50
 NUM_CLIENTS = 4
@@ -85,8 +92,15 @@ def _stack(histories: list[list[dict]], key: str) -> tuple[np.ndarray, np.ndarra
 
 
 def run_convergence(device) -> pd.DataFrame:
-    """FedAvg (IID) vs centralized over several seeds; also save seed-0 snapshots."""
-    fl_histories, central_histories = [], []
+    """FedAvg (IID) vs centralized vs local-only over several seeds; also save snapshots.
+
+    Three baselines bracket the value of federation: ``centralized`` (data pooled,
+    the upper bound), ``FedAvg`` (data stays local, updates are averaged), and
+    ``local-only`` (data stays local AND never aggregated, the lower bound -- mean
+    over clients each trained on its own 1/num_clients slice). The gap
+    centralized >= FedAvg >> local-only is exactly what FedAvg buys.
+    """
+    fl_histories, central_histories, local_histories = [], [], []
     snapshots_by_seed: dict[int, dict] = {}
     global_state = None
     for seed in SEEDS:
@@ -96,20 +110,28 @@ def run_convergence(device) -> pd.DataFrame:
             lr=LR, device=device, seed=seed, snapshot_rounds=snap_rounds, verbose=False,
         )
         central = train_centralized(num_epochs=NUM_ROUNDS, lr=LR, device=device, seed=seed, verbose=False)
+        local = train_local_only(
+            num_rounds=NUM_ROUNDS, num_clients=NUM_CLIENTS, local_epochs=LOCAL_EPOCHS,
+            lr=LR, device=device, seed=seed, verbose=False,
+        )
         fl_histories.append(fl["history"])
         central_histories.append(central["history"])
+        local_histories.append(local["history"])
         if seed in SNAPSHOT_SEEDS:
             snapshots_by_seed[seed] = fl["snapshots"]
         if seed == SEEDS[0]:
             global_state = fl["global_state"]
         print(f"[fl] seed {seed}: FL={fl['history'][-1]['accuracy']:.4f}  "
-              f"centralized={central['history'][-1]['accuracy']:.4f}")
+              f"centralized={central['history'][-1]['accuracy']:.4f}  "
+              f"local-only={local['history'][-1]['accuracy']:.4f}")
 
     rounds = [h["round"] for h in fl_histories[0]]
     fl_acc_m, fl_acc_s = _stack(fl_histories, "accuracy")
     fl_loss_m, fl_loss_s = _stack(fl_histories, "loss")
     c_acc_m, c_acc_s = _stack(central_histories, "accuracy")
     c_loss_m, c_loss_s = _stack(central_histories, "loss")
+    l_acc_m, l_acc_s = _stack(local_histories, "accuracy")
+    l_loss_m, l_loss_s = _stack(local_histories, "loss")
 
     df = pd.DataFrame({
         "round": rounds,
@@ -117,19 +139,23 @@ def run_convergence(device) -> pd.DataFrame:
         "fl_loss_mean": fl_loss_m, "fl_loss_std": fl_loss_s,
         "central_accuracy_mean": c_acc_m, "central_accuracy_std": c_acc_s,
         "central_loss_mean": c_loss_m, "central_loss_std": c_loss_s,
+        "local_accuracy_mean": l_acc_m, "local_accuracy_std": l_acc_s,
+        "local_loss_mean": l_loss_m, "local_loss_std": l_loss_s,
     })
     df.to_csv(METRICS / "fl_training.csv", index=False)
     print(f"[fl] wrote {METRICS / 'fl_training.csv'}")
 
     # Accuracy curve with mean +/- std bands.
     plt.figure(figsize=(7, 4.5))
+    plt.plot(rounds, c_acc_m, "--s", ms=3, color="tab:orange", label="Centralized (data pooled, upper bound)")
+    plt.fill_between(rounds, c_acc_m - c_acc_s, c_acc_m + c_acc_s, color="tab:orange", alpha=0.2)
     plt.plot(rounds, fl_acc_m, "-o", ms=3, color="tab:blue", label="Federated (FedAvg, IID)")
     plt.fill_between(rounds, fl_acc_m - fl_acc_s, fl_acc_m + fl_acc_s, color="tab:blue", alpha=0.2)
-    plt.plot(rounds, c_acc_m, "--s", ms=3, color="tab:orange", label="Centralized")
-    plt.fill_between(rounds, c_acc_m - c_acc_s, c_acc_m + c_acc_s, color="tab:orange", alpha=0.2)
+    plt.plot(rounds, l_acc_m, ":^", ms=3, color="tab:red", label="Local-only (no aggregation, lower bound)")
+    plt.fill_between(rounds, l_acc_m - l_acc_s, l_acc_m + l_acc_s, color="tab:red", alpha=0.15)
     plt.xlabel("Communication round / epoch")
     plt.ylabel("Test accuracy")
-    plt.title(f"Federated vs centralized accuracy (ORL faces, 4 clients, {len(SEEDS)} seeds)")
+    plt.title(f"Centralized vs FedAvg vs local-only (ORL faces, {NUM_CLIENTS} clients, {len(SEEDS)} seeds)")
     plt.ylim(0, 1.02)
     plt.grid(alpha=0.3)
     plt.legend()
@@ -139,13 +165,15 @@ def run_convergence(device) -> pd.DataFrame:
 
     # Loss curve with mean +/- std bands.
     plt.figure(figsize=(7, 4.5))
-    plt.plot(rounds, fl_loss_m, "-o", ms=3, color="tab:blue", label="Federated (FedAvg, IID)")
-    plt.fill_between(rounds, fl_loss_m - fl_loss_s, fl_loss_m + fl_loss_s, color="tab:blue", alpha=0.2)
     plt.plot(rounds, c_loss_m, "--s", ms=3, color="tab:orange", label="Centralized")
     plt.fill_between(rounds, c_loss_m - c_loss_s, c_loss_m + c_loss_s, color="tab:orange", alpha=0.2)
+    plt.plot(rounds, fl_loss_m, "-o", ms=3, color="tab:blue", label="Federated (FedAvg, IID)")
+    plt.fill_between(rounds, fl_loss_m - fl_loss_s, fl_loss_m + fl_loss_s, color="tab:blue", alpha=0.2)
+    plt.plot(rounds, l_loss_m, ":^", ms=3, color="tab:red", label="Local-only (no aggregation)")
+    plt.fill_between(rounds, l_loss_m - l_loss_s, l_loss_m + l_loss_s, color="tab:red", alpha=0.15)
     plt.xlabel("Communication round / epoch")
     plt.ylabel("Test loss (cross-entropy)")
-    plt.title(f"Federated vs centralized loss (ORL faces, 4 clients, {len(SEEDS)} seeds)")
+    plt.title(f"Centralized vs FedAvg vs local-only loss (ORL faces, {NUM_CLIENTS} clients, {len(SEEDS)} seeds)")
     plt.grid(alpha=0.3)
     plt.legend()
     plt.tight_layout()
@@ -158,8 +186,9 @@ def run_convergence(device) -> pd.DataFrame:
     n_snap = sum(len(s) for s in snapshots_by_seed.values())
     print(f"[fl] saved seed-{SEEDS[0]} model + {n_snap} round snapshots "
           f"across {len(snapshots_by_seed)} seeds (for the multi-seed leakage curve)")
-    print(f"[fl] convergence: FL={fl_acc_m[-1]:.4f}+/-{fl_acc_s[-1]:.4f}  "
-          f"centralized={c_acc_m[-1]:.4f}+/-{c_acc_s[-1]:.4f}")
+    print(f"[fl] convergence: centralized={c_acc_m[-1]:.4f}+/-{c_acc_s[-1]:.4f}  "
+          f"FL={fl_acc_m[-1]:.4f}+/-{fl_acc_s[-1]:.4f}  "
+          f"local-only={l_acc_m[-1]:.4f}+/-{l_acc_s[-1]:.4f}")
     return df
 
 

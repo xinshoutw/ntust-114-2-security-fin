@@ -201,6 +201,74 @@ def train_centralized(
     return {"history": history, "state": {k: v.detach().cpu() for k, v in model.state_dict().items()}}
 
 
+def train_local_only(
+    num_rounds: int = 50,
+    num_clients: int = 4,
+    local_epochs: int = 1,
+    lr: float = 0.01,
+    device: torch.device | str | None = None,
+    batch_size: int = 8,
+    num_classes: int = 40,
+    img_size: int = 32,
+    seed: int = 0,
+    optimizer: str = "adam",
+    verbose: bool = True,
+) -> dict:
+    """Each client trains ONLY on its own shard and never aggregates.
+
+    This is the lower-bound baseline that quantifies the *value* of federation: a
+    participant who keeps its data local but also refuses to collaborate. Every
+    client starts from one shared init (the same kind the FedAvg server uses) and
+    runs the same per-round local training as in FedAvg, but the weights are never
+    averaged. We report the mean over clients of the global-test accuracy each
+    round, so the convergence figure can show ``centralized >= FedAvg >> local-only``
+    -- i.e. FedAvg recovers most of the centralized accuracy a lone client (with
+    only its 1/num_clients slice of the data) cannot reach on its own.
+    """
+    device = torch.device(device) if device is not None else get_device()
+    torch.manual_seed(seed)
+
+    full = load_orl_dataset(img_size=img_size)
+    train_set, test_set = train_test_split(full, seed=seed)
+    shards = split_iid(train_set, num_clients=num_clients, seed=seed)
+    test_loader = get_test_loader(test_set, batch_size=32)
+
+    clients = [
+        FLClient(
+            i, shard, LeNet, device,
+            batch_size=batch_size, num_classes=num_classes, optimizer=optimizer,
+        )
+        for i, shard in enumerate(shards)
+    ]
+    # One shared starting point for every client, so the only difference from
+    # FedAvg is the absence of aggregation.
+    init_state = {k: v.detach().cpu().clone() for k, v in LeNet(num_classes=num_classes).state_dict().items()}
+    for client in clients:
+        client.update_model(init_state)
+
+    def mean_metrics() -> tuple[float, float]:
+        accs, losses = [], []
+        for client in clients:
+            acc, loss = evaluate(client.model, test_loader, device)
+            accs.append(acc)
+            losses.append(loss)
+        return sum(accs) / len(accs), sum(losses) / len(losses)
+
+    history: list[dict] = []
+    acc, loss = mean_metrics()
+    history.append({"round": 0, "accuracy": acc, "loss": loss})
+    for rnd in range(1, num_rounds + 1):
+        for client in clients:
+            # No update_model(): each client keeps and extends its own weights.
+            client.train_one_round(local_epochs=local_epochs, lr=lr)
+        acc, loss = mean_metrics()
+        history.append({"round": rnd, "accuracy": acc, "loss": loss})
+        if verbose and (rnd % 5 == 0 or rnd == 1):
+            print(f"[local] round {rnd:2d} | mean client acc {acc:.4f} | loss {loss:.4f}")
+
+    return {"history": history}
+
+
 def run_federated_learning_he(
     num_rounds: int = 5,
     num_clients: int = 4,
