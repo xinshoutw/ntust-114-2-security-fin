@@ -90,21 +90,32 @@ def deserialize_encrypted(
 
 
 def aggregate_encrypted(
-    encrypted_list: list[dict[str, ts.CKKSVector]], num_clients: int
+    encrypted_list: list[dict[str, ts.CKKSVector]],
+    num_clients: int | None = None,
+    weights: list[float] | None = None,
 ) -> dict[str, ts.CKKSVector]:
-    """FedAvg on ciphertext: sum the client vectors and scale by 1/num_clients.
+    """FedAvg on ciphertext: the (sample-)weighted sum of the client vectors.
+
+    ``weights`` are the per-client FedAvg coefficients (e.g. ``n_i / N``) and
+    should sum to 1; each is a plaintext scalar multiplied into its ciphertext
+    (CKKS supports ciphertext + ciphertext and ciphertext * plaintext). When
+    ``weights`` is omitted, falls back to the equal ``1/num_clients`` average,
+    which matches :class:`~src.fl_server.FLServer` under an IID equal split.
 
     Runs entirely on encrypted data, so it is safe for the public-context server.
     """
     if not encrypted_list:
         raise ValueError("no encrypted updates to aggregate")
+    if weights is None:
+        n = num_clients if num_clients is not None else len(encrypted_list)
+        weights = [1.0 / n] * len(encrypted_list)
     names = encrypted_list[0].keys()
     aggregated: dict[str, ts.CKKSVector] = {}
     for name in names:
-        acc = encrypted_list[0][name]
-        for client in encrypted_list[1:]:
-            acc = acc + client[name]
-        aggregated[name] = acc * (1.0 / num_clients)
+        acc = encrypted_list[0][name] * weights[0]
+        for client, w in zip(encrypted_list[1:], weights[1:]):
+            acc = acc + client[name] * w
+        aggregated[name] = acc
     return aggregated
 
 

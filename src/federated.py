@@ -189,9 +189,14 @@ def run_federated_learning_he(
 
     Each round the clients train locally, encrypt their weight deltas with the
     secret-key context, and upload ciphertext. The server (public context only)
-    homomorphically averages the deltas and returns the encrypted result, which
-    the clients decrypt and apply. The server never holds a plaintext gradient,
-    so the DLG attack has nothing to invert.
+    homomorphically computes the sample-weighted FedAvg of the deltas and returns
+    the encrypted result, which the clients decrypt and apply. The server never
+    holds a plaintext gradient, so the DLG attack has nothing to invert.
+
+    The aggregation is intentionally not routed through :class:`FLServer`: that
+    aggregator operates on plaintext tensors, whereas here it must run on
+    ciphertext (:func:`he_utils.aggregate_encrypted`). Both implement the same
+    sample-weighted FedAvg, so they agree under the IID equal split.
 
     Returns ``history`` plus ``timing`` (per-round encrypt/aggregate/decrypt
     seconds) and ``comm`` (plaintext vs ciphertext bytes for one client update).
@@ -232,12 +237,15 @@ def run_federated_learning_he(
         print(f"[he] round 0 | acc {acc:.4f} | loss {loss:.4f}  (init)")
 
     for rnd in range(1, num_rounds + 1):
-        # --- clients: local training, producing weight deltas ---
-        deltas = []
+        # --- clients: local training, producing weight deltas + sample counts ---
+        deltas, counts = [], []
         for client in clients:
             client.update_model(global_state)
-            delta, _ = client.train_one_round(local_epochs=local_epochs, lr=lr)
+            delta, n = client.train_one_round(local_epochs=local_epochs, lr=lr)
             deltas.append({k: v.detach().cpu() for k, v in delta.items()})
+            counts.append(n)
+        total = sum(counts)
+        weights = [n / total for n in counts]  # FedAvg sample weighting
 
         encrypt_time = aggregate_time = decrypt_time = 0.0
         if encrypt:
@@ -257,7 +265,7 @@ def run_federated_learning_he(
             # --- server: homomorphic averaging on the public context only ---
             t0 = time.perf_counter()
             on_server = [he_utils.deserialize_encrypted(w, public_ctx) for w in wire]
-            aggregated = he_utils.aggregate_encrypted(on_server, num_clients=num_clients)
+            aggregated = he_utils.aggregate_encrypted(on_server, weights=weights)
             aggregated_wire = he_utils.serialize_encrypted(aggregated)
             aggregate_time = time.perf_counter() - t0
             # --- client: decrypt and apply the averaged delta ---
@@ -266,9 +274,9 @@ def run_federated_learning_he(
             avg_delta = he_utils.decrypt_gradients(back, shapes)
             decrypt_time = time.perf_counter() - t0
         else:
-            # Plaintext control: identical trajectory, no CKKS rounding.
+            # Plaintext control: same sample-weighted FedAvg, no CKKS rounding.
             avg_delta = {
-                k: torch.stack([d[k] for d in deltas]).mean(0) for k in global_state
+                k: sum(w * d[k] for w, d in zip(weights, deltas)) for k in global_state
             }
 
         global_state = {k: global_state[k] + avg_delta[k] for k in global_state}
