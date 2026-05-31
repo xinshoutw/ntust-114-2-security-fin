@@ -63,9 +63,13 @@ NUM_ITERS = 300
 DEMO_INDICES = [0, 10, 50, 90, 130, 200, 310, 399]  # one image from several subjects
 PROGRESSION_INDEX = 0
 PROGRESSION_ITERS = (0, 3, 10, 30, 100, 300)  # 0 = random init
-# Attack several victims per round so the leakage-vs-round curve is a mean +/- std
-# band, not one image's noisy trajectory. One of these is also shown as the strip.
-ROUNDS_TARGET_INDICES = (5, 40, 90, 130, 200, 250, 310, 399)  # 8 distinct subjects
+# Attack many victims per round so the success-rate curve has fine resolution
+# (8 victims quantises the rate to eighths and leaves a jagged cliff; 16 distinct
+# subjects halves the step and pins the privacy cliff to a tighter round range).
+# One of these is also shown as the image strip.
+ROUNDS_TARGET_INDICES = (
+    5, 15, 25, 40, 55, 90, 110, 130, 155, 200, 225, 250, 275, 310, 350, 399
+)  # 16 distinct subjects
 ROUNDS_STRIP_INDEX = 5  # the victim shown in the image strip + loss curve
 PANEL_ROUNDS = (1, 6, 12, 20, 50)  # subset of SNAPSHOT_ROUNDS shown as an image strip
 BATCH_SIZES = (1, 2, 4, 8)
@@ -262,11 +266,13 @@ def run_dlg_vs_idlg(imgs, lbls, mean, std):
 
 
 def run_rounds(imgs, lbls, mean, std):
-    """Attack several victims at each FL snapshot; leakage decays as the model trains.
+    """Attack many victims at each FL snapshot; leakage decays as the model trains.
 
     Attacking one image gives a noisy, non-monotone curve (the per-image PSNR
-    depends on that image's local loss landscape). Averaging over several victims
-    per round yields a clean mean +/- std band that locates the privacy cliff.
+    depends on that image's local loss landscape). Per victim the outcome is
+    bimodal -- DLG either recovers the face (~50 dB) or stalls at noise (~5 dB) --
+    so we report the *attack success rate* (fraction above the PSNR threshold)
+    over the victims, which is monotone and pins the privacy cliff to a round.
     """
     snapshot_path = RESULTS / "fl_snapshots.pt"
     if not snapshot_path.exists():
