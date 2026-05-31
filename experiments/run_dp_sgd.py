@@ -58,7 +58,12 @@ from src.data_utils import (
     train_test_split,
 )
 from src.dlg_attack import compute_real_gradients, dlg_attack, idlg_label_inference
-from src.dp_utils import compute_epsilon_subsampled, dp_fedavg_grad_list, dp_sgd_local_update
+from src.dp_utils import (
+    clip_grad_list,
+    compute_epsilon_subsampled,
+    dp_fedavg_grad_list,
+    dp_sgd_local_update,
+)
 from src.federated import evaluate, get_device
 from src.metrics import compute_psnr, compute_ssim
 from src.models import LeNet
@@ -140,7 +145,18 @@ def utility_sweep(cts, device) -> dict[float, tuple[float, float]]:
 
 
 def privacy_sweep(imgs, lbls, mean, std) -> tuple[dict, dict, torch.Tensor]:
-    """DLG reconstruction quality + image for each z (per-example clip C, round-0 model)."""
+    """DLG reconstruction quality + image for each z (round-0 model).
+
+    The leakage axis isolates the effect of the *noise*: the demo gradient is
+    clipped to its **own** L2 norm (a no-op at z=0) and then perturbed with std
+    ``z * norm``, so the curve descends purely with z -- directly comparable to the
+    update-level DP-FedAvg leakage curve (``run_dp.py``). Clipping instead to a
+    fixed ``C`` below the gradient's own norm would by itself break naive
+    single-gradient DLG before any noise is added, flattening this axis to the
+    floor (~6 dB) and hiding the trade-off. The actual DP-SGD mechanism still clips
+    per-example *inside* training -- that is what the utility / epsilon axis
+    accounts; this axis answers the separate question "how much noise stops DLG".
+    """
     torch.manual_seed(0)
     model = LeNet(NUM_CLASSES, dlg_init=True).eval()
     image = imgs[TARGET_INDEX : TARGET_INDEX + 1]
@@ -148,11 +164,12 @@ def privacy_sweep(imgs, lbls, mean, std) -> tuple[dict, dict, torch.Tensor]:
     orig01 = denormalize(image, mean, std)
     clean = compute_real_gradients(model, image, label)
     inferred = idlg_label_inference(clean, NUM_CLASSES)
+    clip_g = clip_grad_list(clean, 1e12)[1]  # the gradient's own norm -> z is the only varied factor
 
     quality, recon = {}, {}
     for z in Z_VALUES:
         gen = torch.Generator().manual_seed(0)
-        noisy = dp_fedavg_grad_list(clean, CLIP_NORM, z, generator=gen)  # per-example clip+noise
+        noisy = dp_fedavg_grad_list(clean, clip_g, z, generator=gen)  # clip to own norm, add std z*norm
         rec, _, _ = dlg_attack(
             model, noisy, tuple(image.shape), (1, NUM_CLASSES),
             num_iterations=NUM_ITERS, device="cpu", known_label=inferred, seed=0,
@@ -259,8 +276,8 @@ def main():
         ax.imshow(recon[z].squeeze(), cmap="gray", vmin=0, vmax=1)
         ax.set_title(f"z={z}\neps={es}\n{quality[z]['psnr']:.0f}dB", fontsize=8)
         ax.set_xticks([]); ax.set_yticks([])
-    fig.suptitle(f"DLG reconstruction of image #{TARGET_INDEX} vs DP-SGD noise (per-example clip+Gaussian)",
-                 fontsize=11)
+    fig.suptitle(f"DLG reconstruction of image #{TARGET_INDEX} vs DP-SGD noise multiplier z "
+                 f"(Gaussian on the clipped gradient)", fontsize=11)
     fig.tight_layout()
     fig.savefig(FIGURES / "dp_sgd_leakage_demo.png", dpi=150)
     plt.close(fig)
