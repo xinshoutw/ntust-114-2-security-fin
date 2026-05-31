@@ -80,10 +80,10 @@ Input (1×32×32)
 - **Progression**：擷取單張圖從隨機雜訊 → 人臉的重建過程（`dlg_progression.png`）。
 - **Batch-size sweep**：固定 round 0，batch ∈ {1,2,4,8} 跑 plain DLG，best-match PSNR 隨 batch 單調下降（80→18 dB）。
 - **DLG vs iDLG**：同圖對比收斂速度。
-- **Rounds**：對 `fl_snapshots.pt` 各 round，**每輪攻擊 8 名受害者**、畫 PSNR/SSIM 的 mean±std band，定位隱私臨界（round 20–25 起斷崖）。
+- **Rounds**：對 `fl_snapshots.pt` 各 round，**每輪攻擊 8 名受害者**。主曲線畫**攻擊成功率（PSNR > 20 dB 的受害者比例）**、輔以 mean PSNR——per-victim PSNR 是雙峰（重建成功 ~50 dB 或失敗 ~5 dB，中間幾乎沒有），用平均會報出沒有任何受害者落在的數值，成功率才單調可讀。定位隱私臨界（round 1–10 維持 ~全成功，round 25 起全失敗）。
 
 攻擊成功判定：PSNR > 20 dB（SSIM > 0.5）。
-產出：`dlg_demo_comparison.png`、`dlg_progression.png`、`dlg_batchsize_sweep.png`、`dlg_vs_idlg.png`、`dlg_quality_vs_round.png`、`dlg_rounds_comparison.png`、`dlg_loss_curve.png`、`dlg_attack_results.csv`、`dlg_batchsize.csv`。
+產出：`dlg_demo_comparison.png`、`dlg_progression.png`、`dlg_batchsize_sweep.png`、`dlg_vs_idlg.png`、`dlg_quality_vs_round.png`、`dlg_rounds_comparison.png`、`dlg_loss_curve.png`、`dlg_attack_results.csv`、`dlg_batchsize.csv`、`dlg_quality_vs_round.csv`。
 
 > Threat-model 注記（誠實報告）：DLG 攻擊的是「單樣本、單次 backward 的乾淨梯度」；真實 FedAvg client 上傳的是 batch=8、多步 SGD 後的 weight delta，反演困難得多。batch-size sweep 與 rounds 曲線把這個差距具體化。
 
