@@ -18,5 +18,10 @@ __pycache__/
 # OS
 .DS_Store
 
+# Local working notes / drafts (kept out of the shared repo)
+/IMPLEMENTATION_REVIEW.md
+/FULL_PLAN.md
+/Final Project_v1.pdf
+
 # Note: results/ (figures, metrics CSVs, model checkpoints) ARE committed so
 # team members can view outcomes without re-running the experiments.
