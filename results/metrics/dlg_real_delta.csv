@@ -1,0 +1,3 @@
+image_id,setting,psnr
+5,1step_sgd_delta,84.09257760127561
+5,10step_adam_delta,5.606513314231454

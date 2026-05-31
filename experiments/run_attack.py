@@ -63,18 +63,21 @@ NUM_ITERS = 300
 DEMO_INDICES = [0, 10, 50, 90, 130, 200, 310, 399]  # one image from several subjects
 PROGRESSION_INDEX = 0
 PROGRESSION_ITERS = (0, 3, 10, 30, 100, 300)  # 0 = random init
-# Attack many victims per round so the success-rate curve has fine resolution
-# (8 victims quantises the rate to eighths and leaves a jagged cliff; 16 distinct
-# subjects halves the step and pins the privacy cliff to a tighter round range).
-# One of these is also shown as the image strip.
-ROUNDS_TARGET_INDICES = (
-    5, 15, 25, 40, 55, 90, 110, 130, 155, 200, 225, 250, 275, 310, 350, 399
-)  # 16 distinct subjects
+# Victims attacked per round PER SEED. The leakage-vs-round curve now pools over
+# all snapshot seeds (run_fl saves 3), so 8 victims x 3 seeds = 24 samples per round
+# -- fine success-rate resolution AND seed-averaged, which removes the early-round
+# jitter that a single seed showed (a victim's outcome is bimodal, ~50 dB or ~5 dB).
+ROUNDS_TARGET_INDICES = (5, 40, 90, 130, 200, 250, 310, 399)  # 8 distinct subjects
 ROUNDS_STRIP_INDEX = 5  # the victim shown in the image strip + loss curve
 PANEL_ROUNDS = (1, 6, 12, 20, 50)  # subset of SNAPSHOT_ROUNDS shown as an image strip
 BATCH_SIZES = (1, 2, 4, 8)
 BATCH_INDICES = [0, 40, 80, 120, 160, 200, 240, 280]  # distinct subjects
 SUCCESS_PSNR = 20.0
+# Real-upload attack (run_real_delta): which victim, and the SGD step size used so
+# that a single-step delta equals -lr * gradient (hence exactly invertible).
+REAL_DELTA_INDEX = 5
+REAL_DELTA_LR = 0.1
+REAL_DELTA_ADAM_STEPS = 10  # the multi-step Adam delta a real FedAvg client uploads
 
 RESULTS = Path("results")
 FIGURES = RESULTS / "figures"
@@ -278,25 +281,30 @@ def run_rounds(imgs, lbls, mean, std):
     if not snapshot_path.exists():
         print(f"[attack] {snapshot_path} not found - run experiments/run_fl.py first; skipping rounds")
         return []
-    snapshots = torch.load(snapshot_path, weights_only=True)
-    rounds = sorted(snapshots)
+    snapshots_by_seed = torch.load(snapshot_path, weights_only=True)
+    seeds = sorted(snapshots_by_seed)
+    rounds = sorted(snapshots_by_seed[seeds[0]])
+    strip_seed = seeds[0]  # image strip + loss curves come from one representative seed
+    print(f"[attack] leakage-vs-round pools {len(ROUNDS_TARGET_INDICES)} victims x "
+          f"{len(seeds)} seeds = {len(ROUNDS_TARGET_INDICES) * len(seeds)} attacks/round")
 
     rows, agg, strip_recs, histories = [], [], {}, []
     for rnd in rounds:
-        model = LeNet(NUM_CLASSES, dlg_init=False).to(DEVICE)
-        model.load_state_dict(snapshots[rnd])
-        model.eval()
         psnrs, ssims = [], []
-        for idx in ROUNDS_TARGET_INDICES:
-            image = imgs[idx : idx + 1]
-            label = lbls[idx : idx + 1]
-            _, rec01, m, history = attack_one(model, image, label, mean, std)
-            rows.append({"image_id": idx, "round": rnd, **m})
-            psnrs.append(m["psnr"]); ssims.append(m["ssim"])
-            if idx == ROUNDS_STRIP_INDEX:
-                strip_recs[rnd] = rec01
-                if rnd in PANEL_ROUNDS:
-                    histories.append((rnd, history))
+        for seed in seeds:
+            model = LeNet(NUM_CLASSES, dlg_init=False).to(DEVICE)
+            model.load_state_dict(snapshots_by_seed[seed][rnd])
+            model.eval()
+            for idx in ROUNDS_TARGET_INDICES:
+                image = imgs[idx : idx + 1]
+                label = lbls[idx : idx + 1]
+                _, rec01, m, history = attack_one(model, image, label, mean, std)
+                rows.append({"seed": seed, "image_id": idx, "round": rnd, **m})
+                psnrs.append(m["psnr"]); ssims.append(m["ssim"])
+                if seed == strip_seed and idx == ROUNDS_STRIP_INDEX:
+                    strip_recs[rnd] = rec01
+                    if rnd in PANEL_ROUNDS:
+                        histories.append((rnd, history))
         psnrs, ssims = np.array(psnrs), np.array(ssims)
         success_rate = float((psnrs > SUCCESS_PSNR).mean())
         agg.append({
@@ -307,7 +315,7 @@ def run_rounds(imgs, lbls, mean, std):
         })
         print(f"[attack] round {rnd:2d}: success {success_rate:.0%} (PSNR>{SUCCESS_PSNR:.0f}dB) | "
               f"psnr={psnrs.mean():5.1f}+/-{psnrs.std():4.1f}dB ssim={ssims.mean():.3f}  "
-              f"(n={len(psnrs)} victims)")
+              f"(n={len(psnrs)} = {len(ROUNDS_TARGET_INDICES)}x{len(seeds)} seeds)")
 
     strip_img = imgs[ROUNDS_STRIP_INDEX : ROUNDS_STRIP_INDEX + 1]
     orig01 = denormalize(strip_img, mean, std)
@@ -320,7 +328,9 @@ def run_rounds(imgs, lbls, mean, std):
     axes[0].set_title("original", fontsize=10)
     axes[0].set_xticks([]); axes[0].set_yticks([])
     for ax, rnd in zip(axes[1:], panel_rounds):
-        psnr = next(r["psnr"] for r in rows if r["round"] == rnd and r["image_id"] == ROUNDS_STRIP_INDEX)
+        psnr = next(r["psnr"] for r in rows
+                    if r["round"] == rnd and r["image_id"] == ROUNDS_STRIP_INDEX
+                    and r["seed"] == strip_seed)
         ax.imshow(strip_recs[rnd].squeeze(), cmap="gray", vmin=0, vmax=1)
         ax.set_title(f"round {rnd}\n{psnr:.0f}dB", fontsize=10)
         ax.set_xticks([]); ax.set_yticks([])
@@ -339,7 +349,9 @@ def run_rounds(imgs, lbls, mean, std):
     ax1.plot(adf["round"], 100 * adf["success_rate"], "-o", color="tab:blue", lw=2.2,
              label=f"attack success rate (PSNR > {SUCCESS_PSNR:.0f} dB)")
     ax1.set_xlabel("FL communication round (model training progress)")
-    ax1.set_ylabel(f"DLG success rate over {len(ROUNDS_TARGET_INDICES)} victims (%)", color="tab:blue")
+    ax1.set_ylabel(f"DLG success rate over {len(ROUNDS_TARGET_INDICES) * len(seeds)} "
+                   f"attacks ({len(ROUNDS_TARGET_INDICES)} victims x {len(seeds)} seeds, %)",
+                   color="tab:blue")
     ax1.tick_params(axis="y", labelcolor="tab:blue")
     ax1.set_ylim(-5, 105)
     ax1.grid(alpha=0.3)
@@ -372,6 +384,75 @@ def run_rounds(imgs, lbls, mean, std):
     return rows
 
 
+def run_real_delta(imgs, lbls, mean, std):
+    """Attack the ACTUAL uploaded weight delta, not a separately-computed gradient.
+
+    Closes the threat-model gap the other experiments leave open. A FedAvg client
+    uploads a weight *delta*, not a loss gradient. For one sample and one SGD step,
+    delta = w' - w = -lr * g, so g = -delta/lr is exact and DLG reconstructs the
+    victim perfectly -- proof that the real message is invertible in this canonical
+    case. With the multi-step Adam delta a real client actually sends, the naive
+    g ~ -delta/(steps*lr) no longer holds (Adam rescales per coordinate), so the same
+    attack degrades -- which is exactly why the project's headline attacks target the
+    clean single-sample gradient (the leakage upper bound).
+    """
+    torch.manual_seed(0)
+    model = LeNet(NUM_CLASSES, dlg_init=True).to(DEVICE).eval()
+    names = [n for n, _ in model.named_parameters()]
+    w0 = {n: model.state_dict()[n].clone() for n in names}
+    image = imgs[REAL_DELTA_INDEX : REAL_DELTA_INDEX + 1]
+    label = lbls[REAL_DELTA_INDEX : REAL_DELTA_INDEX + 1]
+    orig01 = denormalize(image, mean, std)
+    crit = torch.nn.CrossEntropyLoss()
+    inferred = idlg_label_inference(compute_real_gradients(model, image, label), NUM_CLASSES)
+
+    def attack_delta(delta, scale, tag):
+        grad = [(-(delta[n]) / scale).detach().clone() for n in names]
+        rec, _, _ = dlg_attack(model, grad, tuple(image.shape), (1, NUM_CLASSES),
+                               num_iterations=NUM_ITERS, device=DEVICE, known_label=inferred)
+        rec01 = denormalize(rec, mean, std)
+        return tag, rec01, compute_psnr(orig01, rec01)
+
+    # (a) one SGD step: delta = -lr * g exactly
+    m = LeNet(NUM_CLASSES, dlg_init=True).to(DEVICE); m.load_state_dict(w0)
+    opt = torch.optim.SGD(m.parameters(), lr=REAL_DELTA_LR)
+    m.train(); opt.zero_grad(); crit(m(image), label).backward(); opt.step()
+    delta_sgd = {n: (m.state_dict()[n] - w0[n]) for n in names}
+    res_a = attack_delta(delta_sgd, REAL_DELTA_LR, "1 sample, 1 SGD step\n(delta = -lr*g, exact)")
+
+    # (b) multi-step Adam: the FedAvg-style upload; naive inversion no longer matches
+    m = LeNet(NUM_CLASSES, dlg_init=True).to(DEVICE); m.load_state_dict(w0)
+    opt = torch.optim.Adam(m.parameters(), lr=0.01)
+    m.train()
+    for _ in range(REAL_DELTA_ADAM_STEPS):
+        opt.zero_grad(); crit(m(image), label).backward(); opt.step()
+    delta_adam = {n: (m.state_dict()[n] - w0[n]) for n in names}
+    res_b = attack_delta(delta_adam, REAL_DELTA_ADAM_STEPS * 0.01,
+                         f"1 sample, {REAL_DELTA_ADAM_STEPS}-step Adam\n(real FedAvg upload)")
+
+    print(f"[attack] real-delta | 1-step SGD: PSNR={res_a[2]:.1f}dB  "
+          f"(proves the upload is invertible) | {REAL_DELTA_ADAM_STEPS}-step Adam: "
+          f"PSNR={res_b[2]:.1f}dB  (multi-step delta resists naive inversion)")
+
+    fig, axes = plt.subplots(1, 3, figsize=(7.2, 3.0))
+    axes[0].imshow(orig01.squeeze(), cmap="gray", vmin=0, vmax=1)
+    axes[0].set_title("original", fontsize=9)
+    axes[0].set_xticks([]); axes[0].set_yticks([])
+    for ax, (tag, rec01, psnr) in zip(axes[1:], (res_a, res_b)):
+        ax.imshow(rec01.squeeze(), cmap="gray", vmin=0, vmax=1)
+        ax.set_title(f"{tag}\n{psnr:.0f}dB", fontsize=8)
+        ax.set_xticks([]); ax.set_yticks([])
+    fig.suptitle("Attacking the ACTUAL uploaded weight delta (not a hand-computed gradient)",
+                 fontsize=10)
+    fig.tight_layout()
+    fig.savefig(FIGURES / "dlg_real_delta.png", dpi=150)
+    plt.close(fig)
+    return [
+        {"image_id": REAL_DELTA_INDEX, "setting": "1step_sgd_delta", "psnr": res_a[2]},
+        {"image_id": REAL_DELTA_INDEX, "setting": f"{REAL_DELTA_ADAM_STEPS}step_adam_delta", "psnr": res_b[2]},
+    ]
+
+
 def main():
     FIGURES.mkdir(parents=True, exist_ok=True)
     METRICS.mkdir(parents=True, exist_ok=True)
@@ -388,6 +469,9 @@ def main():
     run_batch_sweep(imgs, lbls, mean, std)
     print("[attack] === DLG vs iDLG (untrained model) ===")
     run_dlg_vs_idlg(imgs, lbls, mean, std)
+    print("[attack] === real uploaded delta vs hand-computed gradient ===")
+    real_rows = run_real_delta(imgs, lbls, mean, std)
+    pd.DataFrame(real_rows).to_csv(METRICS / "dlg_real_delta.csv", index=False)
     print("[attack] === rounds setting (trained models) ===")
     round_rows = run_rounds(imgs, lbls, mean, std)
 
