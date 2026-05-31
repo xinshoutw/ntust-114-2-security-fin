@@ -57,15 +57,16 @@ Input (1×32×32)
 
 ### 1.5 `src/federated.py`
 - `run_federated_learning(num_rounds=50, num_clients=4, ..., dp_clip=None, dp_noise_multiplier=0.0, split="iid", dirichlet_alpha=0.5, client_sample_rate=1.0, snapshot_rounds=())`：主迴圈，回傳 history + 最終權重 + 指定 round 的 snapshot（供攻擊實驗）。`split` 選 `iid`/`noniid`/`dirichlet`；`client_sample_rate<1` 啟用部分參與（每輪隨機抽一部分 client 訓練，FedAvg 標準作法，讓 client drift 浮現）。
-- `train_centralized(...)`：把資料集中起來訓練同一個 LeNet，作為對照。
+- `train_centralized(...)`：把資料集中起來訓練同一個 LeNet（資料集中、上界）。
+- `train_local_only(...)`：每個 client 只用自己的分片訓練、**永不聚合**（資料留本地但也不協作、下界），回傳逐輪「各 client 在 global test 上準確率的平均」。`centralized ≥ FedAvg ≫ local-only` 的差距就是 FedAvg 的價值。
 - `run_federated_learning_he(...)`：HE 模式（見 Phase 3-1）。
 
 ### 1.6 `experiments/run_fl.py`
 三部分：
-- **收斂**：FedAvg(IID) vs centralized，跑 `seed ∈ {0,1,2}` 取 mean±std（單 seed 兩線會被 test 雜訊蓋過）。密集 snapshot（round 1,2,4,6,8,10,12,15,18,20,22,25,30,40,50，**三個 seed 全存**）供 Step 2 退化曲線跨 seed 平均。
+- **收斂**：centralized vs FedAvg(IID) vs local-only，跑 `seed ∈ {0,1,2}` 取 mean±std。三條 baseline 把聯邦的價值夾出來（centralized 上界、FedAvg、local-only 下界）。密集 snapshot（round 1,2,4,6,8,10,12,15,18,20,22,25,30,40,50，**三個 seed 全存**）供 Step 2 退化曲線跨 seed 平均。
 - **non-IID（client drift）**：10 clients、部分參與（每輪抽 50%）、5 local epochs，比較 IID vs Dirichlet(α=1.0) vs Dirichlet(α=0.1) 的**逐輪收斂曲線**（3 seed mean±std）——α 越小，收斂越慢越震盪、最終準確率越低。畫收斂曲線（非僅最終 bar），drift 才看得到。
 產出：`fl_accuracy_curve.png`、`fl_loss_curve.png`、`fl_noniid_comparison.png`、`fl_training.csv`、`fl_noniid.csv`、`fl_global_model.pt`、`fl_snapshots.pt`（`{seed: {round: state}}`）。
-預期：FedAvg 0.89±0.03、centralized 0.91±0.03（相當，centralized 為上界）；non-IID 收斂曲線隨 α 下降——IID ~0.91、α=1.0 ~0.90、α=0.1 ~0.80 且變異約 3×（drift 明顯）。
+預期：centralized 0.91±0.03 ≥ FedAvg 0.89±0.03 ≫ local-only 0.53±0.01（聚合補回約 36 pp 即聯邦的價值）；non-IID 收斂曲線隨 α 下降——IID ~0.91、α=1.0 ~0.90、α=0.1 ~0.80 且變異約 3×（drift 明顯）。
 
 ---
 
@@ -119,11 +120,11 @@ clip `C=7`（≈ 更新範數中位數），掃 noise multiplier `z ∈ {0, 0.00
 
 對照 `run_dp.py` 的補強：clip **逐樣本**梯度（C=10）、Poisson 取樣、subsampled-RDP 計 ε。固定 q（lot=整個 client shard）、lr=0.5、8 steps/round、50 rounds，掃 `z ∈ {0,0.1,…,3.0}`：
 - **效用**：DP-SGD FedAvg 最終準確率（3 seed mean±std）vs ε。
-- **隱私**：對逐樣本裁剪+加噪的梯度跑 DLG，PSNR vs ε。
+- **隱私**：對單樣本梯度裁到**自身範數**後加噪（隔離噪音效應，z 為唯一變因）跑 DLG，PSNR vs ε。
 - **子取樣對照**：幾個 q<1 點，展示放大能把 ε 壓低但小 lot 摧毀 per-coordinate SNR、準確率崩。
 產出：`dp_sgd_tradeoff.png`、`dp_sgd_leakage_demo.png`、`dp_sgd_tradeoff.csv`、`dp_sgd_subsampling.csv`。
 
-> 觀察（比 update-level 更細緻）：逐樣本裁剪讓準確率**優雅下降**（ε 2824/1046/296/156 ↔ acc 0.94/0.89/0.76/0.56，ε≈98 才崩到隨機），證明 DP「機制」選擇有差（同 ε 下 DP-SGD 準確率遠高於 update-level）；但要 ε<10 仍得犧牲大半準確率，子取樣（q=0.25 把 ε 壓到 49）只是用準確率換更低的 ε——38K 參數、320 張影像上的維度詛咒，以正確放大計帳再次確認，並與 HE（零準確率代價）對比。另注：逐樣本裁剪到 C=10（< 梯度自身範數）本身就把單樣本 DLG 打到 ~5–6 dB，故 DLG 洩漏與 z 幾乎無關、隱私來自裁剪，噪音買的是形式 ε。
+> 觀察（比 update-level 更細緻）：逐樣本裁剪讓準確率**優雅下降**（ε 2824/1046/296/156 ↔ acc 0.94/0.89/0.76/0.56，ε≈98 才崩到隨機），證明 DP「機制」選擇有差（同 ε 下 DP-SGD 準確率遠高於 update-level）；但要 ε<10 仍得犧牲大半準確率，子取樣（q=0.25 把 ε 壓到 49）只是用準確率換更低的 ε——38K 參數、320 張影像上的維度詛咒，以正確放大計帳再次確認，並與 HE（零準確率代價）對比。DLG 洩漏軸（裁到自身範數以隔離噪音）：z=0 乾淨梯度 84 dB、一加噪即崩到 ~5 dB，與 DP-FedAvg 同樣「經驗隱私便宜」——兩機制的差別在**準確率軸**（優雅下降 vs 急崖），不在洩漏軸。
 
 ---
 
