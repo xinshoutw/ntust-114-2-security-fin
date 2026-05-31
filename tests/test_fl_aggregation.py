@@ -2,7 +2,9 @@
 
 import torch
 from torch import nn
+from torch.utils.data import TensorDataset
 
+from src.data_utils import split_iid, split_noniid
 from src.fl_server import FLServer
 
 
@@ -42,3 +44,34 @@ def test_equal_weights_recover_plain_average():
 
     new_state = server.get_global_state_dict()
     assert torch.allclose(new_state["fc.weight"], torch.full((2, 3), 4.0))  # 2.0 + 2.0
+
+
+def _labelled_dataset(num_subjects: int = 40, per: int = 8) -> TensorDataset:
+    labels = torch.arange(num_subjects).repeat_interleave(per)
+    images = torch.randn(len(labels), 1, 32, 32)
+    return TensorDataset(images, labels)
+
+
+def test_split_iid_partitions_all_samples_disjointly():
+    ds = _labelled_dataset()
+    shards = split_iid(ds, num_clients=4)
+    counts = [len(s) for s in shards]
+    assert sum(counts) == len(ds)
+    # IID shards each see most subjects (unlike a non-IID client's disjoint 10),
+    # which is the whole point of the IID split -- random, not label-partitioned.
+    for shard in shards:
+        subjects = {int(ds.tensors[1][i]) for i in shard.indices}
+        assert len(subjects) >= 25
+
+
+def test_split_noniid_gives_each_client_a_disjoint_block_of_subjects():
+    ds = _labelled_dataset(num_subjects=40, per=8)
+    shards = split_noniid(ds, num_clients=4)
+    assert sum(len(s) for s in shards) == len(ds)
+    seen: set[int] = set()
+    for shard in shards:
+        subjects = {int(ds.tensors[1][i]) for i in shard.indices}
+        assert len(subjects) == 10  # 40 subjects / 4 clients
+        assert subjects.isdisjoint(seen)  # no subject shared across clients
+        seen |= subjects
+    assert len(seen) == 40

@@ -162,6 +162,40 @@ def split_iid(dataset, num_clients: int = 4, seed: int = 0) -> list[Subset]:
     return [Subset(dataset, sorted(shard)) for shard in shards]
 
 
+def _labels_of(dataset) -> torch.Tensor:
+    """Return the label tensor backing ``dataset`` (a Subset or a TensorDataset)."""
+    base = dataset.dataset if isinstance(dataset, Subset) else dataset
+    return base.tensors[1]
+
+
+def split_noniid(dataset, num_clients: int = 4, seed: int = 0) -> list[Subset]:
+    """Pathological label-partition split: each client owns a disjoint block of subjects.
+
+    With 40 subjects and ``num_clients=4`` every client sees exactly 10 distinct
+    subjects and *no* subject is shared across clients -- the standard worst-case
+    non-IID setting (cf. McMahan et al., 2017). Compared with :func:`split_iid`
+    this is what surfaces client drift: each client's local optimum pulls toward
+    its own 10 classes, so the FedAvg of those updates degrades once clients take
+    several local steps between communication rounds. The ``seed`` argument is
+    accepted for signature parity with :func:`split_iid` (the block assignment is
+    deterministic, so it is unused).
+    """
+    base = dataset.dataset if isinstance(dataset, Subset) else dataset
+    labels = _labels_of(dataset)
+    indices = dataset.indices if isinstance(dataset, Subset) else list(range(len(dataset)))
+    num_subjects = int(labels.max().item()) + 1
+    per_client = num_subjects // num_clients
+    shards = []
+    for k in range(num_clients):
+        lo, hi = k * per_client, (k + 1) * per_client
+        # The last client absorbs any remainder subjects (num_subjects % num_clients).
+        if k == num_clients - 1:
+            hi = num_subjects
+        shard = [i for i in indices if lo <= int(labels[i]) < hi]
+        shards.append(Subset(base, sorted(shard)))
+    return shards
+
+
 def get_test_loader(dataset, batch_size: int = 32) -> DataLoader:
     """Build a non-shuffling DataLoader over the global test set."""
     return DataLoader(dataset, batch_size=batch_size, shuffle=False)

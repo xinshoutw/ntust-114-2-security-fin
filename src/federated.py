@@ -15,7 +15,13 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from src import he_utils
-from src.data_utils import get_test_loader, load_orl_dataset, split_iid, train_test_split
+from src.data_utils import (
+    get_test_loader,
+    load_orl_dataset,
+    split_iid,
+    split_noniid,
+    train_test_split,
+)
 from src.fl_client import FLClient
 from src.fl_server import FLServer
 from src.models import LeNet
@@ -59,6 +65,7 @@ def run_federated_learning(
     he_rounds: int = 5,
     dp_clip: float | None = None,
     dp_noise_multiplier: float = 0.0,
+    split: str = "iid",
     verbose: bool = True,
 ) -> dict:
     """Train with FedAvg and return history plus the final (and snapshot) weights.
@@ -67,6 +74,10 @@ def run_federated_learning(
       - ``history``: list of ``{"round", "accuracy", "loss"}`` (round 0 = init)
       - ``global_state``: final global weights (on CPU)
       - ``snapshots``: ``{round: cpu_state_dict}`` for each round in ``snapshot_rounds``
+
+    ``split`` selects the client data partition: ``"iid"`` (equal random shards)
+    or ``"noniid"`` (each client owns a disjoint block of subjects), the latter
+    used to demonstrate client drift.
 
     With ``use_he=True`` the rounds run under CKKS encryption (see
     :func:`run_federated_learning_he`); only ``he_rounds`` rounds are run and the
@@ -84,7 +95,8 @@ def run_federated_learning(
 
     full = load_orl_dataset(img_size=img_size)
     train_set, test_set = train_test_split(full, seed=seed)
-    shards = split_iid(train_set, num_clients=num_clients, seed=seed)
+    split_fn = split_noniid if split == "noniid" else split_iid
+    shards = split_fn(train_set, num_clients=num_clients, seed=seed)
     test_loader = get_test_loader(test_set, batch_size=32)
 
     server = FLServer(LeNet, device=device, num_classes=num_classes)
