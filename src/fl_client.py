@@ -18,6 +18,8 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
+from src.dp_utils import add_relative_gaussian_noise
+
 
 class FLClient:
     def __init__(
@@ -55,9 +57,14 @@ class FLClient:
         self.model.load_state_dict(copy.deepcopy(global_state_dict))
 
     def train_one_round(
-        self, local_epochs: int = 1, lr: float = 0.01
+        self, local_epochs: int = 1, lr: float = 0.01, dp_sigma: float = 0.0
     ) -> tuple[dict[str, torch.Tensor], int]:
-        """Run local training and return ``(weight_delta, num_samples)``."""
+        """Run local training and return ``(weight_delta, num_samples)``.
+
+        When ``dp_sigma > 0`` the weight delta is perturbed with Gaussian noise
+        (std = ``dp_sigma * rms(delta)``) before it leaves the client -- the
+        DP-FedAvg defence (see :mod:`src.dp_utils`).
+        """
         start_weights = {k: v.detach().clone() for k, v in self.model.state_dict().items()}
         optimizer = self._make_optimizer(lr)
         self.model.train()
@@ -70,6 +77,8 @@ class FLClient:
                 optimizer.step()
         end_weights = self.model.state_dict()
         delta = {k: (end_weights[k] - start_weights[k]).detach().clone() for k in start_weights}
+        if dp_sigma > 0:
+            delta = add_relative_gaussian_noise(delta, dp_sigma)
         self._last_delta = delta
         return delta, self.num_samples
 

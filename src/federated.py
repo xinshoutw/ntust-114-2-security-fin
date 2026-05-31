@@ -57,6 +57,7 @@ def run_federated_learning(
     snapshot_rounds: tuple[int, ...] = (),
     use_he: bool = False,
     he_rounds: int = 5,
+    dp_sigma: float = 0.0,
     verbose: bool = True,
 ) -> dict:
     """Train with FedAvg and return history plus the final (and snapshot) weights.
@@ -110,7 +111,7 @@ def run_federated_learning(
         updates = []
         for client in clients:
             client.update_model(global_state)
-            delta, n = client.train_one_round(local_epochs=local_epochs, lr=lr)
+            delta, n = client.train_one_round(local_epochs=local_epochs, lr=lr, dp_sigma=dp_sigma)
             updates.append((delta, n))
         server.aggregate(updates)
 
