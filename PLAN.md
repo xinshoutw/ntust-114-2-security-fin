@@ -32,6 +32,8 @@ ORL/AT&T/Olivetti（同一份，40 人 × 10 張）首次執行時自動從 `llo
 - `load_orl_dataset(img_size=32, normalize=True)`：讀全部影像 → resize 32×32 灰階 → **z-score 正規化**（零均值單位變異；Sigmoid 網路餵原始 [0,1] 會卡在 loss plateau，這步是收斂關鍵），mean/std 附在 dataset 上供攻擊端反正規化。
 - `train_test_split(test_per_subject=2)`：每人留 2 張 = 80 張 global test，其餘 320 張訓練。
 - `split_iid(num_clients=4)`：IID 等分。
+- `split_noniid(num_clients=4)`：病態 label-block 切分（每 client 持有不重疊的 subject 區塊）。
+- `split_dirichlet(num_clients, alpha, ...)`：可調 Dirichlet(α) label skew（Hsu et al. 2019）；α 越小越極端 non-IID，α 大趨近 IID。配合多 client + 部分參與才看得出 client drift。
 - `denormalize(images, mean, std)`：把重建影像映回 [0,1] 顯示。
 
 ### 1.2 `src/models.py`
@@ -54,16 +56,16 @@ Input (1×32×32)
 - `aggregate(client_updates)`：樣本加權 FedAvg `w ← w + Σ (n_i/N)·delta_i`。
 
 ### 1.5 `src/federated.py`
-- `run_federated_learning(num_rounds=50, num_clients=4, ..., dp_clip=None, dp_noise_multiplier=0.0, snapshot_rounds=())`：主迴圈，回傳 history + 最終權重 + 指定 round 的 snapshot（供攻擊實驗）。
+- `run_federated_learning(num_rounds=50, num_clients=4, ..., dp_clip=None, dp_noise_multiplier=0.0, split="iid", dirichlet_alpha=0.5, client_sample_rate=1.0, snapshot_rounds=())`：主迴圈，回傳 history + 最終權重 + 指定 round 的 snapshot（供攻擊實驗）。`split` 選 `iid`/`noniid`/`dirichlet`；`client_sample_rate<1` 啟用部分參與（每輪隨機抽一部分 client 訓練，FedAvg 標準作法，讓 client drift 浮現）。
 - `train_centralized(...)`：把資料集中起來訓練同一個 LeNet，作為對照。
 - `run_federated_learning_he(...)`：HE 模式（見 Phase 3-1）。
 
 ### 1.6 `experiments/run_fl.py`
 三部分：
-- **收斂**：FedAvg(IID) vs centralized，跑 `seed ∈ {0,1,2}` 取 mean±std（單 seed 兩線會被 test 雜訊蓋過）。密集 snapshot（round 1,2,4,6,8,10,12,15,18,20,22,25,30,40,50，取 seed=0）供 Step 2 退化曲線。
-- **non-IID**：IID vs non-IID 切分在 local_epochs ∈ {1,3,5} 的最終準確率（3 seed）——本地步數越多、client drift 越大、non-IID 掉點越明顯。
-產出：`fl_accuracy_curve.png`、`fl_loss_curve.png`、`fl_noniid_comparison.png`、`fl_training.csv`、`fl_noniid.csv`、`fl_global_model.pt`、`fl_snapshots.pt`。
-預期：FedAvg 0.88±0.01、centralized 0.90±0.02（相當）；non-IID 與 IID 的差距隨 local epochs 變大（E=1 同為 0.888，E=20 時 IID 0.946 vs non-IID 0.896）。
+- **收斂**：FedAvg(IID) vs centralized，跑 `seed ∈ {0,1,2}` 取 mean±std（單 seed 兩線會被 test 雜訊蓋過）。密集 snapshot（round 1,2,4,6,8,10,12,15,18,20,22,25,30,40,50，**三個 seed 全存**）供 Step 2 退化曲線跨 seed 平均。
+- **non-IID（client drift）**：10 clients、部分參與（每輪抽 50%）、5 local epochs，比較 IID vs Dirichlet(α=1.0) vs Dirichlet(α=0.1) 的**逐輪收斂曲線**（3 seed mean±std）——α 越小，收斂越慢越震盪、最終準確率越低。畫收斂曲線（非僅最終 bar），drift 才看得到。
+產出：`fl_accuracy_curve.png`、`fl_loss_curve.png`、`fl_noniid_comparison.png`、`fl_training.csv`、`fl_noniid.csv`、`fl_global_model.pt`、`fl_snapshots.pt`（`{seed: {round: state}}`）。
+預期：FedAvg 0.89±0.03、centralized 0.91±0.03（相當，centralized 為上界）；non-IID 收斂曲線隨 α 下降——IID ~0.91、α=1.0 ~0.90、α=0.1 ~0.80 且變異約 3×（drift 明顯）。
 
 ---
 
@@ -82,12 +84,13 @@ Input (1×32×32)
 - **Progression**：擷取單張圖從隨機雜訊 → 人臉的重建過程（`dlg_progression.png`）。
 - **Batch-size sweep**：固定 round 0，batch ∈ {1,2,4,8} 跑 plain DLG，best-match PSNR 隨 batch 單調下降（80→18 dB）。
 - **DLG vs iDLG**：同圖對比收斂速度。
-- **Rounds**：對 `fl_snapshots.pt` 各 round，**每輪攻擊 16 名受害者**（16 distinct subjects，成功率解析度比 8 倍細、cliff 定位更準）。主曲線畫**攻擊成功率（PSNR > 20 dB 的受害者比例）**、輔以 mean PSNR——per-victim PSNR 是雙峰（重建成功 ~50 dB 或失敗 ~5 dB，中間幾乎沒有），用平均會報出沒有任何受害者落在的數值，成功率才單調可讀。定位隱私臨界（round 1–10 維持 ~全成功，round 25 起全失敗）。
+- **Rounds**：對 `fl_snapshots.pt` 各 round，每輪攻擊 8 名受害者 **× 3 snapshot seeds = 24 次攻擊**並 pool（跨 seed 平均，消除單 seed 的前段抖動）。主曲線畫**攻擊成功率（PSNR > 20 dB 的比例）**、輔以 mean PSNR——per-victim PSNR 是雙峰（重建成功 ~50 dB 或失敗 ~5 dB，中間幾乎沒有），用平均會報出沒有任何受害者落在的數值，成功率才單調可讀。隱私臨界（跨 seed 平均）：round 1 全成功、round 2–12 約 54–88% 震盪、round 15–30 由 58% 降到 8%、round 40 起 0%（比單 seed 的「20–25 急崖」更平緩、也更誠實）。
+- **Real delta（補 threat-model 缺口）**：`run_real_delta` 攻擊**真正上傳的 weight delta**而非另算的梯度。1 樣本 + 1 步 SGD 時 `delta = -lr·g`，反演近乎完美（~84 dB，證明真實上傳可被反演）；改成真實 FedAvg 的多步 Adam delta 後，naive 反演失效（~6 dB）。產出 `dlg_real_delta.png`、`dlg_real_delta.csv`。
 
 攻擊成功判定：PSNR > 20 dB（SSIM > 0.5）。
-產出：`dlg_demo_comparison.png`、`dlg_progression.png`、`dlg_batchsize_sweep.png`、`dlg_vs_idlg.png`、`dlg_quality_vs_round.png`、`dlg_rounds_comparison.png`、`dlg_loss_curve.png`、`dlg_attack_results.csv`、`dlg_batchsize.csv`、`dlg_quality_vs_round.csv`。
+產出：`dlg_demo_comparison.png`、`dlg_progression.png`、`dlg_batchsize_sweep.png`、`dlg_vs_idlg.png`、`dlg_quality_vs_round.png`、`dlg_rounds_comparison.png`、`dlg_loss_curve.png`、`dlg_real_delta.png`、`dlg_attack_results.csv`、`dlg_batchsize.csv`、`dlg_quality_vs_round.csv`、`dlg_real_delta.csv`。
 
-> Threat-model 注記（誠實報告）：DLG 攻擊的是「單樣本、單次 backward 的乾淨梯度」；真實 FedAvg client 上傳的是 batch=8、多步 SGD 後的 weight delta，反演困難得多。batch-size sweep 與 rounds 曲線把這個差距具體化。
+> Threat-model 注記（誠實報告）：主要實驗攻擊的是「單樣本、單次 backward 的乾淨梯度」（洩漏上界）；真實 FedAvg client 上傳的是 batch、多步優化後的 weight delta，反演困難得多。`run_real_delta` 直接量化此差距，batch-size sweep 與 rounds 曲線進一步具體化。
 
 ---
 
@@ -98,6 +101,8 @@ DP-FedAvg / DP-SGD 的高斯機制：
 - `clip_update(update, C)` / `clip_grad_list(grads, C)`：把更新裁剪到 L2 範數 `C`（界定 sensitivity，沒有它就沒有合法 ε）。
 - `dp_fedavg_update(update, clip_norm, noise_multiplier)` / `dp_fedavg_grad_list(...)`：先裁剪再加 `N(0,(z·C)²)` 高斯噪音（`z` = noise multiplier）。
 - `gaussian_rdp` / `rdp_to_epsilon` / `compute_epsilon`：以 **RDP**（Mironov 2017）把 `z` 與 round 數換算成 **(ε, δ)** 預算（單次高斯機制為 `(α, α/(2z²))`-RDP，跨輪相加後轉 (ε,δ)）。ε 只取決於 z 與 round 數。
+- `compute_rdp_subsampled_gaussian` / `compute_epsilon_subsampled`：**子取樣高斯機制**的 RDP（Mironov–Talwar–Zhang 2019，log 空間數值穩定，與 TF-Privacy/Opacus 同），給 DP-SGD 的隱私放大。q=1 退化為 plain Gaussian（已測）。
+- `per_sample_gradients`（`torch.func` vmap+grad）/ `dp_sgd_local_update`：DP-SGD 本地步——Poisson 取樣 lot、**逐樣本**梯度裁剪到 C、加 `N(0,(zC)²)`、除以期望 lot 大小後做 SGD step，回傳 weight delta。
 
 ### 3.2 整合
 `FLClient.train_one_round(dp_clip=C, dp_noise_multiplier=z)` 在更新離開 client 前套用；`run_federated_learning(dp_clip, dp_noise_multiplier)` 串接。
@@ -108,7 +113,17 @@ clip `C=7`（≈ 更新範數中位數），掃 noise multiplier `z ∈ {0, 0.00
 - **隱私**：對單樣本梯度套同一機制後跑 DLG，PSNR/SSIM vs ε。
 產出：`dp_tradeoff.png`（x 軸標 z 與對應 ε）、`dp_leakage_demo.png`、`dp_tradeoff.csv`。
 
-> 觀察：高維小模型下，足以打垮 DLG 的噪音（z≈0.01 即把 84→6 dB、且準確率仍 ~0.89）對應的 ε 仍是天文數字（無實質保證）；要拿到有意義的 ε（≲60）所需的噪音已把準確率打到隨機水準。DP 在此代價極高，與 HE 形成對比（維度詛咒）。
+> 觀察：高維小模型下，足以打垮 DLG 的噪音（z≈0.002 即把 84→12 dB、且準確率仍 ~0.90）對應的 ε 仍是天文數字（無實質保證）；要拿到有意義的 ε（≲60）所需的噪音已把準確率打到隨機水準。這是 **update-level** 機制的代價（無放大、聚合裁剪），與 HE 形成對比（維度詛咒）。
+
+### 3.4 `experiments/run_dp_sgd.py`（record-level DP-SGD，Abadi 機制）
+
+對照 `run_dp.py` 的補強：clip **逐樣本**梯度（C=10）、Poisson 取樣、subsampled-RDP 計 ε。固定 q（lot=整個 client shard）、lr=0.5、8 steps/round、50 rounds，掃 `z ∈ {0,0.1,…,3.0}`：
+- **效用**：DP-SGD FedAvg 最終準確率（3 seed mean±std）vs ε。
+- **隱私**：對逐樣本裁剪+加噪的梯度跑 DLG，PSNR vs ε。
+- **子取樣對照**：幾個 q<1 點，展示放大能把 ε 壓低但小 lot 摧毀 per-coordinate SNR、準確率崩。
+產出：`dp_sgd_tradeoff.png`、`dp_sgd_leakage_demo.png`、`dp_sgd_tradeoff.csv`、`dp_sgd_subsampling.csv`。
+
+> 觀察（比 update-level 更細緻）：逐樣本裁剪讓準確率**優雅下降**（ε 2824/1046/296/156 ↔ acc 0.94/0.89/0.76/0.56，ε≈98 才崩到隨機），證明 DP「機制」選擇有差（同 ε 下 DP-SGD 準確率遠高於 update-level）；但要 ε<10 仍得犧牲大半準確率，子取樣（q=0.25 把 ε 壓到 49）只是用準確率換更低的 ε——38K 參數、320 張影像上的維度詛咒，以正確放大計帳再次確認，並與 HE（零準確率代價）對比。另注：逐樣本裁剪到 C=10（< 梯度自身範數）本身就把單樣本 DLG 打到 ~5–6 dB，故 DLG 洩漏與 z 幾乎無關、隱私來自裁剪，噪音買的是形式 ε。
 
 ---
 
@@ -123,7 +138,7 @@ TenSEAL CKKS：`create_he_context`（含 secret key，client 持有）、`create
 2. 每輪：client 本地訓練 → encrypt(delta) → 上傳密文；server（只有 public key）密文聚合後回傳；client decrypt 並套用。
 
 ### 3-1.3 `experiments/run_defense.py`
-- **A. 收斂性**：加密 FedAvg vs 同 seed 的明文軌跡（差 ≤ 0.0125）。
+- **A. 收斂性**：加密 FedAvg vs 同 seed 的明文軌跡（逐輪最大差 ≤ 0.025，終局 0.875 vs 0.8625）。
 - **B. 防禦展示（結構論證）**：server 持 public context → `decrypt()` 直接拋 `ValueError`（無 secret key）→ 連 DLG 的目標函數 `‖g_dummy − g_real‖²` 都湊不出來。圖中第三格展示 server 實際只持有高熵密文（entropy ≈ 8/8 bits/byte）。**這不是「DLG 跑了但失敗」，而是「攻擊者拿不到攻擊所需的明文梯度」。**
 - **C. Trade-off**：每輪 encrypt/aggregate/decrypt 耗時、密文 vs 明文通訊量（~32.7×）。
 產出：`he_accuracy_comparison.png`、`he_time_breakdown.png`、`he_defense_demo.png`、`he_training.csv`、`he_communication.csv`。
@@ -136,9 +151,10 @@ TenSEAL CKKS：`create_he_context`（含 secret key，client 持有）、`create
 uv sync
 uv run python experiments/run_fl.py        # Step 1：FedAvg + centralized baseline（需先跑以產生 snapshots）
 uv run python experiments/run_attack.py    # Step 2：DLG / iDLG 攻擊
-uv run python experiments/run_dp.py        # Step 3：DP-FedAvg 防禦（accuracy / DLG vs ε）
+uv run python experiments/run_dp.py        # Step 3：update-level DP-FedAvg（accuracy / DLG vs ε）
+uv run python experiments/run_dp_sgd.py    # Step 3：record-level DP-SGD（subsampled-RDP，graceful trade-off）
 uv run python experiments/run_defense.py   # Step 3-1：CKKS 同態加密防禦
-uv run pytest                              # FedAvg / metrics / DLG / DP / HE roundtrip
+uv run pytest                              # FedAvg / metrics / DLG / DP / DP-SGD / dirichlet / HE roundtrip
 ```
 
 每個 experiment script 都是 self-contained：載入資料、建模、跑實驗、存圖存 CSV。
@@ -160,4 +176,6 @@ uv run pytest                              # FedAvg / metrics / DLG / DP / HE ro
 
 - FL training 可用 MPS 加速；DLG（LBFGS）與所有 TenSEAL/HE 操作在 CPU（TenSEAL 不支援 MPS，LBFGS 在 CPU 較穩）。
 - z-score 正規化 + DLG 初始化 + Adam 三者缺一，Sigmoid LeNet 會卡在 2.5% chance。
-- DP 的 ε 只取決於 noise multiplier z 與 round 數；clip 界 C 只影響效用（裁剪偏差 vs 噪音尺度）。
+- DP 的 ε 只取決於 noise multiplier z（與子取樣率 q）與步數；clip 界 C 只影響效用（裁剪偏差 vs 噪音尺度），不進 ε。
+- DP-SGD 的 per-coordinate SNR ~ lot_size / (z·√dim)：38K 維、每 client 僅 80 張，小 lot 會讓 SNR<1，這就是「有意義 ε 必崩準確率」的根因；用 `torch.func` vmap 算逐樣本梯度。
+- HE/TenSEAL 在 CPU；fc.weight (40×768) 超過 8192 slot，TenSEAL 自動跨多密文打包（會印 matmul/conv2d disabled 警告，本專案只用加法與標量乘，無影響）。
