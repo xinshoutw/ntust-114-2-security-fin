@@ -15,10 +15,14 @@ from src.dp_utils import (
     clip_grad_list,
     clip_update,
     compute_epsilon,
+    compute_epsilon_subsampled,
+    compute_rdp_subsampled_gaussian,
     dp_fedavg_grad_list,
     dp_fedavg_update,
+    dp_sgd_local_update,
     flat_l2_norm,
     gaussian_rdp,
+    per_sample_gradients,
     rdp_to_epsilon,
 )
 
@@ -122,6 +126,66 @@ def test_epsilon_grows_with_more_rounds():
 
 def test_zero_noise_gives_infinite_epsilon():
     assert compute_epsilon(noise_multiplier=0.0, steps=50, delta=1e-5) == float("inf")
+
+
+# --- subsampled-Gaussian (DP-SGD) RDP accountant ------------------------------
+
+def test_subsampled_rdp_with_full_sampling_matches_plain_gaussian():
+    # q=1 is no subsampling, so it must reduce to the plain Gaussian RDP exactly.
+    orders = (2.0, 4.0, 8.0)
+    sub = compute_rdp_subsampled_gaussian(q=1.0, noise_multiplier=1.3, steps=7, orders=orders)
+    plain = gaussian_rdp(noise_multiplier=1.3, steps=7, orders=orders)
+    for a in orders:
+        assert math.isclose(sub[a], plain[a], rel_tol=1e-9)
+
+
+def test_subsampling_amplifies_privacy_smaller_q_smaller_epsilon():
+    # Privacy amplification by subsampling: a smaller sampling rate => smaller epsilon
+    # at the same noise and step count.
+    eps_full = compute_epsilon_subsampled(q=1.0, noise_multiplier=1.0, steps=400, delta=1e-5)
+    eps_sub = compute_epsilon_subsampled(q=0.1, noise_multiplier=1.0, steps=400, delta=1e-5)
+    assert eps_sub < eps_full
+    assert eps_sub > 0.0
+
+
+def test_subsampled_epsilon_decreases_as_noise_increases():
+    eps_low = compute_epsilon_subsampled(q=0.125, noise_multiplier=0.6, steps=400, delta=1e-5)
+    eps_high = compute_epsilon_subsampled(q=0.125, noise_multiplier=3.0, steps=400, delta=1e-5)
+    assert eps_high < eps_low
+
+
+# --- DP-SGD per-example clipping local update ---------------------------------
+
+def test_per_sample_gradients_have_a_leading_batch_dim():
+    from src.models import LeNet
+
+    torch.manual_seed(0)
+    model = LeNet(num_classes=40)
+    images = torch.randn(5, 1, 32, 32)
+    labels = torch.randint(0, 40, (5,))
+    grads = per_sample_gradients(model, images, labels)
+    assert grads["fc.weight"].shape == (5, 40, 768)  # one gradient per example
+    assert grads["fc.bias"].shape == (5, 40)
+
+
+def test_dp_sgd_local_update_returns_a_delta_over_all_params_and_moves_weights():
+    from src.models import LeNet
+
+    torch.manual_seed(0)
+    model = LeNet(num_classes=40)
+    before = {k: v.clone() for k, v in model.state_dict().items()}
+    images = torch.randn(40, 1, 32, 32)
+    labels = torch.randint(0, 40, (40,))
+    delta = dp_sgd_local_update(
+        model, images, labels, clip_norm=1.0, noise_multiplier=1.0,
+        sample_rate=0.5, local_steps=4, lr=0.5,
+        generator=torch.Generator().manual_seed(0),
+    )
+    assert set(delta) == set(before)  # every parameter has an update
+    # delta == w_after - w_before, so applying it to the start recovers the trained weights.
+    for k in before:
+        assert torch.allclose(before[k] + delta[k], model.state_dict()[k], atol=1e-5)
+    assert flat_l2_norm(delta) > 0.0  # training actually moved the weights
 
 
 # --- client integration: the uploaded update is actually clipped --------------
