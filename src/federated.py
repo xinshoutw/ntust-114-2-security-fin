@@ -7,7 +7,6 @@ trains a single model on the pooled data as an upper-bound reference.
 
 from __future__ import annotations
 
-import copy
 import time
 
 import torch
@@ -18,6 +17,7 @@ from src import he_utils
 from src.data_utils import (
     get_test_loader,
     load_orl_dataset,
+    split_dirichlet,
     split_iid,
     split_noniid,
     train_test_split,
@@ -66,6 +66,8 @@ def run_federated_learning(
     dp_clip: float | None = None,
     dp_noise_multiplier: float = 0.0,
     split: str = "iid",
+    dirichlet_alpha: float = 0.5,
+    client_sample_rate: float = 1.0,
     verbose: bool = True,
 ) -> dict:
     """Train with FedAvg and return history plus the final (and snapshot) weights.
@@ -95,8 +97,12 @@ def run_federated_learning(
 
     full = load_orl_dataset(img_size=img_size)
     train_set, test_set = train_test_split(full, seed=seed)
-    split_fn = split_noniid if split == "noniid" else split_iid
-    shards = split_fn(train_set, num_clients=num_clients, seed=seed)
+    if split == "dirichlet":
+        shards = split_dirichlet(train_set, num_clients=num_clients, alpha=dirichlet_alpha, seed=seed)
+    elif split == "noniid":
+        shards = split_noniid(train_set, num_clients=num_clients, seed=seed)
+    else:
+        shards = split_iid(train_set, num_clients=num_clients, seed=seed)
     test_loader = get_test_loader(test_set, batch_size=32)
 
     server = FLServer(LeNet, device=device, num_classes=num_classes)
@@ -119,10 +125,22 @@ def run_federated_learning(
     if verbose:
         print(f"[fl] round  0 | acc {acc:.4f} | loss {loss:.4f}  (init)")
 
+    # Partial participation: with client_sample_rate < 1 only a random subset of
+    # clients trains each round (standard FedAvg). Combined with many clients and a
+    # skewed split, this is what makes client drift bite -- the global model lurches
+    # toward whichever clients were sampled. Sampling is seeded for reproducibility.
+    part_gen = torch.Generator().manual_seed(seed + 12345)
+    n_part = max(1, round(client_sample_rate * num_clients))
+
     for rnd in range(1, num_rounds + 1):
         global_state = server.get_global_state_dict()
+        if n_part >= num_clients:
+            participating = clients
+        else:
+            pick = torch.randperm(num_clients, generator=part_gen)[:n_part].tolist()
+            participating = [clients[i] for i in pick]
         updates = []
-        for client in clients:
+        for client in participating:
             client.update_model(global_state)
             delta, n = client.train_one_round(
                 local_epochs=local_epochs, lr=lr,

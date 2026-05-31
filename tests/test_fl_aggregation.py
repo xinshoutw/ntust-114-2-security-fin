@@ -4,7 +4,7 @@ import torch
 from torch import nn
 from torch.utils.data import TensorDataset
 
-from src.data_utils import split_iid, split_noniid
+from src.data_utils import split_dirichlet, split_iid, split_noniid
 from src.fl_server import FLServer
 
 
@@ -75,3 +75,24 @@ def test_split_noniid_gives_each_client_a_disjoint_block_of_subjects():
         assert subjects.isdisjoint(seen)  # no subject shared across clients
         seen |= subjects
     assert len(seen) == 40
+
+
+def test_split_dirichlet_partitions_all_samples_with_no_empty_client():
+    ds = _labelled_dataset(num_subjects=40, per=8)
+    shards = split_dirichlet(ds, num_clients=10, alpha=0.5, seed=0, min_per_client=2)
+    # Every sample assigned exactly once, no client left empty.
+    all_idx = sorted(i for s in shards for i in s.indices)
+    assert all_idx == list(range(len(ds)))
+    assert all(len(s) >= 2 for s in shards)
+
+
+def test_split_dirichlet_small_alpha_is_more_skewed_than_large_alpha():
+    # Smaller alpha => each client is dominated by fewer classes (stronger non-IID).
+    ds = _labelled_dataset(num_subjects=40, per=8)
+
+    def mean_classes_per_client(alpha):
+        shards = split_dirichlet(ds, num_clients=10, alpha=alpha, seed=0)
+        counts = [len({int(ds.tensors[1][i]) for i in s.indices}) for s in shards]
+        return sum(counts) / len(counts)
+
+    assert mean_classes_per_client(0.1) < mean_classes_per_client(100.0)

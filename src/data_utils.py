@@ -196,6 +196,44 @@ def split_noniid(dataset, num_clients: int = 4, seed: int = 0) -> list[Subset]:
     return shards
 
 
+def split_dirichlet(
+    dataset, num_clients: int = 20, alpha: float = 0.5, seed: int = 0, min_per_client: int = 2
+) -> list[Subset]:
+    """Dirichlet label-skew partition (Hsu et al., 2019) -- the standard *tunable*
+    non-IID split.
+
+    For each class the samples are split across clients in proportions drawn from
+    ``Dirichlet(alpha)``. Small ``alpha`` (e.g. 0.1) makes the proportions extreme,
+    so each client ends up dominated by a few classes (strong non-IID); large
+    ``alpha`` (e.g. 100) approaches a uniform, IID-like split. Unlike
+    :func:`split_noniid` (a fixed disjoint-block split), ``alpha`` lets the degree of
+    heterogeneity be swept, which -- together with many clients and partial
+    participation -- is what makes client drift clearly visible.
+
+    Re-draws (bounded) until every client holds at least ``min_per_client`` samples,
+    so no client is empty under an extreme ``alpha``.
+    """
+    base = dataset.dataset if isinstance(dataset, Subset) else dataset
+    labels = _labels_of(dataset)
+    indices = np.array(dataset.indices if isinstance(dataset, Subset) else list(range(len(dataset))))
+    lab = labels[indices].numpy()
+    classes = np.unique(lab)
+
+    for attempt in range(100):
+        rng = np.random.default_rng(seed + attempt)
+        client_idx: list[list[int]] = [[] for _ in range(num_clients)]
+        for c in classes:
+            c_idx = indices[lab == c].copy()
+            rng.shuffle(c_idx)
+            proportions = rng.dirichlet([alpha] * num_clients)
+            cuts = (np.cumsum(proportions) * len(c_idx)).astype(int)[:-1]
+            for k, part in enumerate(np.split(c_idx, cuts)):
+                client_idx[k].extend(part.tolist())
+        if all(len(ci) >= min_per_client for ci in client_idx):
+            break
+    return [Subset(base, sorted(ci)) for ci in client_idx]
+
+
 def get_test_loader(dataset, batch_size: int = 32) -> DataLoader:
     """Build a non-shuffling DataLoader over the global test set."""
     return DataLoader(dataset, batch_size=batch_size, shuffle=False)

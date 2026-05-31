@@ -49,15 +49,29 @@ NUM_CLIENTS = 4
 LOCAL_EPOCHS = 1
 LR = 0.01
 SEEDS = (0, 1, 2)  # average the convergence curves over seeds for a mean +/- std band
-SNAPSHOT_SEED = 0  # the attack reconstructs from this run's snapshots
+# The attack reconstructs from these runs' snapshots; we now keep ALL seeds (not
+# just seed 0) so the leakage-vs-round success rate can be averaged over seeds and
+# its early-round jitter (a single-seed artefact) smoothed out.
+SNAPSHOT_SEEDS = SEEDS
 # Dense early sampling so the DLG leakage-vs-round curve resolves the "privacy
 # cliff" (gradients stop leaking once the model leaves its high-curvature init).
 SNAPSHOT_ROUNDS = (1, 2, 4, 6, 8, 10, 12, 15, 18, 20, 22, 25, 30, 40, 50)
-# Local-epoch settings for the non-IID drift sweep. Drift only bites once clients
-# take many local steps between rounds: at E=1 the IID and non-IID splits are
-# indistinguishable, and the gap opens up only by E=10-20 (each client overfits
-# to its own disjoint subjects before the averages are reconciled).
-NONIID_LOCAL_EPOCHS = (1, 5, 10, 20)
+
+# --- Non-IID client-drift experiment (Dirichlet label skew + partial participation) ---
+# The old 4-client, full-participation block split barely moved (drift needs scale).
+# We now use more clients with partial participation and a *tunable* Dirichlet(alpha)
+# label skew, and plot per-round convergence curves (not just final accuracy), which
+# is where drift actually shows up: smaller alpha => slower, noisier convergence and a
+# real final-accuracy gap.
+NONIID_CLIENTS = 10
+NONIID_SAMPLE_RATE = 0.5  # 5 of 10 clients per round
+NONIID_LOCAL_EPOCHS = 5
+# Each entry: (label, split, dirichlet_alpha). alpha is ignored unless split=dirichlet.
+NONIID_SETTINGS = (
+    ("IID", "iid", None),
+    ("Dirichlet alpha=1.0 (mild)", "dirichlet", 1.0),
+    ("Dirichlet alpha=0.1 (severe)", "dirichlet", 0.1),
+)
 
 RESULTS = Path("results")
 FIGURES = RESULTS / "figures"
@@ -73,9 +87,10 @@ def _stack(histories: list[list[dict]], key: str) -> tuple[np.ndarray, np.ndarra
 def run_convergence(device) -> pd.DataFrame:
     """FedAvg (IID) vs centralized over several seeds; also save seed-0 snapshots."""
     fl_histories, central_histories = [], []
-    snapshots, global_state = None, None
+    snapshots_by_seed: dict[int, dict] = {}
+    global_state = None
     for seed in SEEDS:
-        snap_rounds = SNAPSHOT_ROUNDS if seed == SNAPSHOT_SEED else ()
+        snap_rounds = SNAPSHOT_ROUNDS if seed in SNAPSHOT_SEEDS else ()
         fl = run_federated_learning(
             num_rounds=NUM_ROUNDS, num_clients=NUM_CLIENTS, local_epochs=LOCAL_EPOCHS,
             lr=LR, device=device, seed=seed, snapshot_rounds=snap_rounds, verbose=False,
@@ -83,8 +98,10 @@ def run_convergence(device) -> pd.DataFrame:
         central = train_centralized(num_epochs=NUM_ROUNDS, lr=LR, device=device, seed=seed, verbose=False)
         fl_histories.append(fl["history"])
         central_histories.append(central["history"])
-        if seed == SNAPSHOT_SEED:
-            snapshots, global_state = fl["snapshots"], fl["global_state"]
+        if seed in SNAPSHOT_SEEDS:
+            snapshots_by_seed[seed] = fl["snapshots"]
+        if seed == SEEDS[0]:
+            global_state = fl["global_state"]
         print(f"[fl] seed {seed}: FL={fl['history'][-1]['accuracy']:.4f}  "
               f"centralized={central['history'][-1]['accuracy']:.4f}")
 
@@ -137,52 +154,67 @@ def run_convergence(device) -> pd.DataFrame:
     print(f"[fl] wrote convergence figures to {FIGURES}")
 
     torch.save(global_state, RESULTS / "fl_global_model.pt")
-    torch.save(snapshots, RESULTS / "fl_snapshots.pt")
-    print(f"[fl] saved seed-{SNAPSHOT_SEED} model + {len(snapshots)} round snapshots")
+    torch.save(snapshots_by_seed, RESULTS / "fl_snapshots.pt")
+    n_snap = sum(len(s) for s in snapshots_by_seed.values())
+    print(f"[fl] saved seed-{SEEDS[0]} model + {n_snap} round snapshots "
+          f"across {len(snapshots_by_seed)} seeds (for the multi-seed leakage curve)")
     print(f"[fl] convergence: FL={fl_acc_m[-1]:.4f}+/-{fl_acc_s[-1]:.4f}  "
           f"centralized={c_acc_m[-1]:.4f}+/-{c_acc_s[-1]:.4f}")
     return df
 
 
 def run_noniid(device) -> pd.DataFrame:
-    """IID vs non-IID FedAvg final accuracy across local-epoch counts (client drift)."""
-    rows = []
-    for le in NONIID_LOCAL_EPOCHS:
-        for split in ("iid", "noniid"):
-            accs = [
-                run_federated_learning(
-                    num_rounds=NUM_ROUNDS, num_clients=NUM_CLIENTS, local_epochs=le,
-                    lr=LR, device=device, seed=s, split=split, verbose=False,
-                )["history"][-1]["accuracy"]
-                for s in SEEDS
-            ]
-            rows.append({
-                "local_epochs": le, "split": split,
-                "acc_mean": float(np.mean(accs)), "acc_std": float(np.std(accs)),
-            })
-            print(f"[fl] non-IID sweep: E={le} {split:6s} "
-                  f"acc={rows[-1]['acc_mean']:.4f}+/-{rows[-1]['acc_std']:.4f}")
-    df = pd.DataFrame(rows)
+    """IID vs Dirichlet non-IID FedAvg *convergence curves* under partial participation.
+
+    With many clients (NONIID_CLIENTS) and partial participation (NONIID_SAMPLE_RATE),
+    a tunable Dirichlet(alpha) label skew makes client drift visible: smaller alpha
+    gives a slower, noisier convergence and a lower final accuracy. We plot the
+    per-round curves (3-seed mean +/- std) -- the gap and the instability are the
+    point, not just the endpoint.
+    """
+    colors = ["tab:blue", "tab:orange", "tab:red"]
+    curves = []  # (label, rounds, acc_mean, acc_std, final_mean, final_std)
+    for (label, split, alpha) in NONIID_SETTINGS:
+        histories = []
+        for s in SEEDS:
+            res = run_federated_learning(
+                num_rounds=NUM_ROUNDS, num_clients=NONIID_CLIENTS,
+                local_epochs=NONIID_LOCAL_EPOCHS, lr=LR, device=device, seed=s,
+                split=split, dirichlet_alpha=(alpha or 0.5),
+                client_sample_rate=NONIID_SAMPLE_RATE, verbose=False,
+            )
+            histories.append(res["history"])
+        rounds = [h["round"] for h in histories[0]]
+        acc_m, acc_s = _stack(histories, "accuracy")
+        curves.append((label, rounds, acc_m, acc_s, acc_m[-1], acc_s[-1]))
+        print(f"[fl] non-IID: {label:28s} final acc={acc_m[-1]:.4f}+/-{acc_s[-1]:.4f}")
+
+    # Per-round CSV: one accuracy mean/std column per setting.
+    data = {"round": curves[0][1]}
+    for (label, _, acc_m, acc_s, _, _) in curves:
+        key = label.split()[0].lower() if label != "IID" else "iid"
+        if "0.1" in label:
+            key = "dirichlet_a0.1"
+        elif "1.0" in label:
+            key = "dirichlet_a1.0"
+        data[f"{key}_acc_mean"] = acc_m
+        data[f"{key}_acc_std"] = acc_s
+    df = pd.DataFrame(data)
     df.to_csv(METRICS / "fl_noniid.csv", index=False)
     print(f"[fl] wrote {METRICS / 'fl_noniid.csv'}")
 
-    iid = df[df["split"] == "iid"].set_index("local_epochs")
-    non = df[df["split"] == "noniid"].set_index("local_epochs")
-    epochs = list(NONIID_LOCAL_EPOCHS)
-    x = np.arange(len(epochs))
-    w = 0.38
-    plt.figure(figsize=(7, 4.5))
-    plt.bar(x - w / 2, iid.loc[epochs, "acc_mean"], w, yerr=iid.loc[epochs, "acc_std"],
-            capsize=4, color="tab:blue", label="IID split")
-    plt.bar(x + w / 2, non.loc[epochs, "acc_mean"], w, yerr=non.loc[epochs, "acc_std"],
-            capsize=4, color="tab:red", label="Non-IID split (disjoint subjects)")
-    plt.xticks(x, [f"E={e}" for e in epochs])
-    plt.xlabel("Local epochs per round (more local steps => more client drift)")
-    plt.ylabel("Final test accuracy (mean +/- std, 3 seeds)")
-    plt.title("IID vs non-IID FedAvg: the gap widens with local epochs (client drift)")
+    plt.figure(figsize=(7.5, 4.8))
+    for (label, rounds, acc_m, acc_s, fm, fs), c in zip(curves, colors):
+        plt.plot(rounds, acc_m, "-o", ms=2.5, color=c, label=f"{label}  (final {fm:.2f})")
+        plt.fill_between(rounds, acc_m - acc_s, acc_m + acc_s, color=c, alpha=0.15)
+    plt.xlabel("Communication round")
+    plt.ylabel("Test accuracy (mean +/- std, 3 seeds)")
+    plt.title(f"Client drift: IID vs Dirichlet non-IID\n"
+              f"({NONIID_CLIENTS} clients, {NONIID_SAMPLE_RATE:.0%} sampled/round, "
+              f"E={NONIID_LOCAL_EPOCHS} local epochs)")
     plt.ylim(0, 1.02)
-    plt.grid(alpha=0.3, axis="y")
-    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.legend(fontsize=8, loc="lower right")
     plt.tight_layout()
     plt.savefig(FIGURES / "fl_noniid_comparison.png", dpi=150)
     plt.close()
