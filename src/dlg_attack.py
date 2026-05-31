@@ -65,6 +65,8 @@ def dlg_attack(
     lr: float = 1.0,
     known_label: int | None = None,
     seed: int = 0,
+    image_log: list[tuple[int, torch.Tensor]] | None = None,
+    log_iters: tuple[int, ...] = (),
 ) -> tuple[torch.Tensor, int | list[int], list[float]]:
     """Reconstruct an input image by matching gradients.
 
@@ -73,6 +75,11 @@ def dlg_attack(
 
     Returns ``(recovered_image, recovered_label, loss_history)`` with the image
     detached on CPU and the loss history one entry per LBFGS evaluation.
+
+    Pass an ``image_log`` list together with ``log_iters`` to capture
+    ``(iteration, dummy_image)`` snapshots (CPU copies) at those iterations --
+    iteration 0 is the random initialisation -- for the noise->face progression
+    figure.
     """
     device = torch.device(device)
     model = model.to(device)
@@ -94,7 +101,10 @@ def dlg_attack(
     criterion = nn.CrossEntropyLoss()
     history: list[float] = []
 
-    for _ in range(num_iterations):
+    if image_log is not None and 0 in log_iters:
+        image_log.append((0, dummy_image.detach().cpu().clone()))
+
+    for it in range(num_iterations):
 
         def closure():
             optimizer.zero_grad()
@@ -110,6 +120,8 @@ def dlg_attack(
 
         loss_value = optimizer.step(closure)
         history.append(float(loss_value.item()))
+        if image_log is not None and (it + 1) in log_iters:
+            image_log.append((it + 1, dummy_image.detach().cpu().clone()))
 
     if known_label is not None:
         recovered_label = known_label

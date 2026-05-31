@@ -24,6 +24,7 @@ Experiments:
 
 Outputs:
     results/figures/dlg_demo_comparison.png
+    results/figures/dlg_progression.png
     results/figures/dlg_batchsize_sweep.png
     results/figures/dlg_vs_idlg.png
     results/figures/dlg_rounds_comparison.png
@@ -56,6 +57,8 @@ DEVICE = "cpu"  # LBFGS-based DLG is most stable on CPU
 NUM_CLASSES = 40
 NUM_ITERS = 300
 DEMO_INDICES = [0, 10, 50, 90, 130, 200, 310, 399]  # one image from several subjects
+PROGRESSION_INDEX = 0
+PROGRESSION_ITERS = (0, 3, 10, 30, 100, 300)  # 0 = random init
 ROUNDS_TARGET_INDEX = 5
 PANEL_ROUNDS = (1, 6, 12, 20, 50)  # subset of SNAPSHOT_ROUNDS shown as an image strip
 BATCH_SIZES = (1, 2, 4, 8)
@@ -114,6 +117,45 @@ def run_demo(imgs, lbls, mean, std):
     fig.savefig(FIGURES / "dlg_demo_comparison.png", dpi=150)
     plt.close(fig)
     return rows
+
+
+def run_progression(imgs, lbls, mean, std):
+    """Snapshot the dummy image as LBFGS turns random noise into the victim's face.
+
+    This is the figure that makes the attack legible: the demo pairs look like
+    the original twice because the reconstruction is near-perfect, so instead we
+    show the bottom image *becoming* the face, starting from pure noise.
+    """
+    torch.manual_seed(0)
+    model = LeNet(NUM_CLASSES, dlg_init=True).to(DEVICE).eval()
+    image = imgs[PROGRESSION_INDEX : PROGRESSION_INDEX + 1]
+    label = lbls[PROGRESSION_INDEX : PROGRESSION_INDEX + 1]
+    orig01 = denormalize(image, mean, std)
+    grads = compute_real_gradients(model, image, label)
+    inferred = idlg_label_inference(grads, NUM_CLASSES)
+
+    log: list[tuple[int, "torch.Tensor"]] = []
+    _, _, _ = dlg_attack(
+        model, grads, tuple(image.shape), (1, NUM_CLASSES),
+        num_iterations=NUM_ITERS, device=DEVICE, known_label=inferred,
+        image_log=log, log_iters=PROGRESSION_ITERS,
+    )
+
+    cols = len(log) + 1
+    fig, axes = plt.subplots(1, cols, figsize=(1.6 * cols, 2.4))
+    for ax, (it, snap) in zip(axes, log):
+        psnr = compute_psnr(orig01, denormalize(snap, mean, std))
+        ax.imshow(denormalize(snap, mean, std).squeeze(), cmap="gray", vmin=0, vmax=1)
+        ax.set_title(("random init" if it == 0 else f"iter {it}") + f"\n{psnr:.0f}dB", fontsize=9)
+        ax.set_xticks([]); ax.set_yticks([])
+    axes[-1].imshow(orig01.squeeze(), cmap="gray", vmin=0, vmax=1)
+    axes[-1].set_title("original", fontsize=9)
+    axes[-1].set_xticks([]); axes[-1].set_yticks([])
+    fig.suptitle("DLG reconstructs the face from random noise (gradient matching)", fontsize=12)
+    fig.tight_layout()
+    fig.savefig(FIGURES / "dlg_progression.png", dpi=150)
+    plt.close(fig)
+    print(f"[attack] progression: {[it for it, _ in log]} iters -> dlg_progression.png")
 
 
 def run_batch_sweep(imgs, lbls, mean, std):
@@ -296,6 +338,8 @@ def main():
 
     print("[attack] === demo setting (untrained model) ===")
     demo_rows = run_demo(imgs, lbls, mean, std)
+    print("[attack] === reconstruction progression (untrained model) ===")
+    run_progression(imgs, lbls, mean, std)
     print("[attack] === batch-size sweep (untrained model) ===")
     run_batch_sweep(imgs, lbls, mean, std)
     print("[attack] === DLG vs iDLG (untrained model) ===")
