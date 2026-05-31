@@ -66,7 +66,11 @@ CLIP_NORM = 7.0  # ~ median client-update L2 norm (active clipping; standard DP-
 DELTA = 1e-5
 SEEDS = (0, 1, 2)
 # Noise multipliers; z=0 is the clip-only baseline (no noise -> epsilon = inf).
-Z_VALUES = (0.0, 0.01, 0.02, 0.03, 0.05, 0.1, 0.2, 0.5, 1.0)
+# Fine-grained points below z=0.01 resolve the privacy "knee": the noise std is
+# scaled to the gradient's global L2 norm but added per coordinate, so in ~38K
+# dimensions DLG collapses across a narrow z in [0.001, 0.01]. Without these the
+# leakage axis is a single step (84 dB -> ~6 dB) instead of a visible curve.
+Z_VALUES = (0.0, 0.001, 0.002, 0.003, 0.005, 0.007, 0.01, 0.02, 0.03, 0.05, 0.1, 0.2, 0.5, 1.0)
 
 RESULTS = Path("results")
 FIGURES = RESULTS / "figures"
@@ -180,7 +184,7 @@ def main():
     acc_s = df["acc_std"].to_numpy()
     psnr = df["dlg_psnr"].to_numpy()
 
-    fig, ax1 = plt.subplots(figsize=(8.5, 4.8))
+    fig, ax1 = plt.subplots(figsize=(11.0, 4.8))
     ax1.plot(x, acc_m, "-o", color="tab:green", label="FedAvg accuracy (mean +/- std, 3 seeds)")
     ax1.fill_between(x, acc_m - acc_s, acc_m + acc_s, color="tab:green", alpha=0.2)
     ax1.axhline(base_acc, ls=":", color="tab:green", lw=1, alpha=0.7,
@@ -189,7 +193,7 @@ def main():
     ax1.tick_params(axis="y", labelcolor="tab:green")
     ax1.set_ylim(0, 1.02)
     ax1.set_xticks(x)
-    ax1.set_xticklabels([f"z={z}\nε={_eps_label(z)}" for z in Z_VALUES], fontsize=8)
+    ax1.set_xticklabels([f"z={z}\nε={_eps_label(z)}" for z in Z_VALUES], fontsize=7, rotation=45)
     ax1.set_xlabel("DP noise multiplier z  (and resulting privacy budget ε; δ=1e-5, 50 rounds)")
     ax1.grid(alpha=0.3)
 
@@ -209,11 +213,14 @@ def main():
     plt.close(fig)
 
     # --- Visual: the victim image reconstructed under growing noise / shrinking epsilon ---
-    fig, axes = plt.subplots(1, len(Z_VALUES) + 1, figsize=(1.55 * (len(Z_VALUES) + 1), 2.7))
+    # A representative subset across the knee keeps the strip readable; the full
+    # sweep (all Z_VALUES) lives in the curve and the CSV.
+    demo_z = [z for z in (0.0, 0.001, 0.002, 0.003, 0.005, 0.01, 0.05, 0.2, 1.0) if z in recon]
+    fig, axes = plt.subplots(1, len(demo_z) + 1, figsize=(1.55 * (len(demo_z) + 1), 2.7))
     axes[0].imshow(orig01.squeeze(), cmap="gray", vmin=0, vmax=1)
     axes[0].set_title("original", fontsize=9)
     axes[0].set_xticks([]); axes[0].set_yticks([])
-    for ax, z in zip(axes[1:], Z_VALUES):
+    for ax, z in zip(axes[1:], demo_z):
         eps = compute_epsilon(z, NUM_ROUNDS, DELTA)
         es = "inf" if eps == float("inf") else f"{eps:.0f}"
         ax.imshow(recon[z].squeeze(), cmap="gray", vmin=0, vmax=1)
